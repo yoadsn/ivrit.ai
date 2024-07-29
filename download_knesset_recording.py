@@ -586,7 +586,7 @@ def parse_committee_timestampped_protocol_doc(
         {
             "start_loc": text_timestamp_start_locs,
             "end_loc": text_timestamp_end_locs,
-            "timestamp": text_timestamps,
+            "timestamp": cleanup_html_time_map_arr(np.asarray(text_timestamps)),
         },
     ).sort_values("timestamp")
 
@@ -1136,7 +1136,7 @@ def download_committee_session(
         session_id, committee_target_folder, committee_id_target_folder
     )
 
-    print(f"Download plenum {session_id} done.")
+    print(f"Download committee session {session_id} done.")
 
 
 def download(args):
