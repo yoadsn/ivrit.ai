@@ -551,6 +551,8 @@ def parse_committee_timestampped_protocol_doc(
                     # Replace two mid markers with spaces to keep the list indexing proper
                     main_text_gather[anchor_end_marker_idx] = ""
                     main_text_gather[to_merge_start_marker_idx] = ""
+                    # New end is at the end of the merged segment
+                    anchor_end_marker_idx = to_merge_end_marker_idx
                 # Else - no need to merge
                 else:
                     # The new anchor moves fwd, the to_merge resets
