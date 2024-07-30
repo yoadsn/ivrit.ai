@@ -447,7 +447,9 @@ def parse_committee_timestampped_protocol_doc(
                     forced_ancillary_text_range_pattern or is_bookmark_like_text_pattern
                 ):
                     main_text_gather.append(c.text)
-                    text_length_in_timestampped_range += len(c.text.strip())
+                    text_length_in_timestampped_range += len(
+                        normalize_text_as_caption_text(c.text)
+                    )
                     had_text_parts = True
                 else:
                     ancillary_text_gather.append(c.text)
@@ -502,8 +504,9 @@ def parse_committee_timestampped_protocol_doc(
     to_merge_start_marker_seconds = 0
     to_merge_end_marker_idx = None
 
+    to_merge_marker_contains_non_whitespace = False
     for pidx, part in enumerate(main_text_gather):
-        # Only work on time markers
+        # Keep Track of time markers
         if isinstance(part, TimeMarker):
             ## Capture phase
 
@@ -519,6 +522,7 @@ def parse_committee_timestampped_protocol_doc(
                     to_merge_start_marker_idx = pidx
                     to_merge_start_marker_id = part.id
                     to_merge_start_marker_seconds = part.seconds
+                    to_merge_marker_contains_non_whitespace = False
             else:
                 if anchor_start_marker_id == part.id:
                     anchor_end_marker_idx = pidx
@@ -537,7 +541,9 @@ def parse_committee_timestampped_protocol_doc(
                 anchor_len_seconds = (
                     to_merge_start_marker_seconds - anchor_start_marker_seconds
                 )
-                if anchor_len_seconds >= 0 and anchor_len_seconds < 3:
+                if (
+                    anchor_len_seconds >= 0 and anchor_len_seconds < 3  # Too short
+                ) or not to_merge_marker_contains_non_whitespace:  # Only whitespaces
                     # "Swallow" the to_merge segment by moving the anchor end to the end
                     main_text_gather[to_merge_end_marker_idx] = main_text_gather[
                         anchor_end_marker_idx
@@ -559,6 +565,12 @@ def parse_committee_timestampped_protocol_doc(
                 to_merge_start_marker_id = None
                 to_merge_start_marker_seconds = 0
                 to_merge_end_marker_idx = None
+        else:
+            # Text parts which have only spaces will force the marker to merge
+            # it's content with the previous marker. VTT cannot read such text parts.
+            part_text = str(part)
+            if part_text.strip():
+                to_merge_marker_contains_non_whitespace = True
 
     # Seperate text parts from to text and time index
     text_timestamp_index = {}
@@ -595,7 +607,7 @@ def parse_committee_timestampped_protocol_doc(
     return all_processed_text, timestamp_index_df
 
 
-def noramzlie_text_as_caption_text(text: str) -> str:
+def normalize_text_as_caption_text(text: str) -> str:
     return re.sub(r"\s+", " ", text)
 
 
@@ -604,11 +616,11 @@ def create_caption(text: str, start: float, end: float) -> Caption:
         # Format to hh:mm:ss.zzz
         start=strftime("%H:%M:%S.000", gmtime(start)),
         end=strftime("%H:%M:%S.000", gmtime(end)),
-        text=noramzlie_text_as_caption_text(text),
+        text=normalize_text_as_caption_text(text),
     )
 
 
-def create_plenum_transcript_vtt(text: str, time_index: pd.DataFrame) -> WebVTT:
+def create_recording_transcript_vtt(text: str, time_index: pd.DataFrame) -> WebVTT:
     vtt = WebVTT()
     time_index = time_index.copy()  # assumed to be sorted
     time_index["next_ts"] = time_index.timestamp.shift(-1).ffill()
@@ -1062,7 +1074,7 @@ def download_plenum(
     )
 
     print("Creating a VTT file of the transcript...")
-    vtt = create_plenum_transcript_vtt(transcript_text, transcript_time_index_df)
+    vtt = create_recording_transcript_vtt(transcript_text, transcript_time_index_df)
     vtt.save(plenum_target_folder / f"{id}.vtt", add_bom=True)
 
     if not skip_download_video_file:
@@ -1124,7 +1136,7 @@ def download_committee_session(
     )
 
     print("Creating a VTT file of the transcript...")
-    vtt = create_plenum_transcript_vtt(transcript_text, transcript_time_index_df)
+    vtt = create_recording_transcript_vtt(transcript_text, transcript_time_index_df)
     vtt.save(committee_target_folder / f"{session_id}.vtt", add_bom=True)
 
     if not skip_download_video_file:
