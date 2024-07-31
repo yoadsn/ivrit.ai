@@ -45,6 +45,7 @@ knesset_protocol_page_content_api_url = (
 
 # Custom Scraping target for committee data discovery
 base_knesset_committee_url = "https://main.knesset.gov.il/"
+committee_broadcast_player_page_base_url = f"{base_knesset_committee_url}/Activity/committees/Finance/Pages/CommitteeTVarchive.aspx"
 
 # Parliament Odata service data discovery
 parliament_service_odata_manifest_url = (
@@ -765,7 +766,7 @@ def get_committee_video_resource_url(
         # Apparently - the "folder" of the committee does not matter - the "TopicID" works anyway. (hmm)
         # We need to load this page since it contains the edited - non "inferrable" video stream url
         # (There exists and easy way to get the non edited video recording, but it is almost always missing the first part and has extra junk at the end)
-        broadcast_pointer_page_url = f"https://main.knesset.gov.il/Activity/committees/Finance/Pages/CommitteeTVarchive.aspx?TopicID={video_recording_topic_id}"
+        broadcast_pointer_page_url = f"{committee_broadcast_player_page_base_url}?TopicID={video_recording_topic_id}"
 
         print("Scraping broadcast page by TopicID for video URL.")
         broadcast_pointer_page_html_content = requests.get(
