@@ -23,16 +23,12 @@ def extract_text_and_time_index_from_vtt(vtt):
         total_text_length += len(caption.text)
         time_obj = strptime(caption.start, "%H:%M:%S.%f")
         start_seconds = time_obj.tm_hour * 3600 + time_obj.tm_min * 60 + time_obj.tm_sec
-        time_index_coords.append(
-            (start_seconds, text_length_before_text_part, total_text_length)
-        )
+        time_index_coords.append((start_seconds, text_length_before_text_part, total_text_length))
 
     all_text = "".join(all_text_parts)
     time_index = np.asarray(time_index_coords)
     sorted_time_index = time_index[time_index[:, 0].argsort()]
-    sorted_time_index = (
-        sorted_time_index.T
-    )  # 3 x N, row 0 = ts, row 1 = start_loc, row 2 = end_loc
+    sorted_time_index = sorted_time_index.T  # 3 x N, row 0 = ts, row 1 = start_loc, row 2 = end_loc
 
     return all_text, sorted_time_index
 
@@ -60,9 +56,7 @@ def get_approximate_text_split_points(text_split_points, low_target, high_target
 def generate_transcription_character_dictionary(
     reference_text,
 ) -> tuple[dict[str, int], np.ndarray]:
-    cleaned_up_text_for_dict_gen = re.sub(
-        r"[\s,.?]+", " ", reference_text
-    )  # Consdier sampling if text here is huge
+    cleaned_up_text_for_dict_gen = re.sub(r"[\s,.?]+", " ", reference_text)  # Consdier sampling if text here is huge
     dict_vocab = sorted(list(set(list(cleaned_up_text_for_dict_gen))))
     # create a dict which maps from a vocab character to an index in this character-histogram vector
     dictionary = {c: i for i, c in enumerate(dict_vocab)}
@@ -99,21 +93,15 @@ def find_matching_locations_by_hist(
         start_loc, end_loc = search_range
 
         # Go over all text splits - and check matches
-        window_locs_to_compare = np.arange(
-            start_loc, end_loc - window_size, stride_size
-        )
+        window_locs_to_compare = np.arange(start_loc, end_loc - window_size, stride_size)
 
         for window_start_loc in window_locs_to_compare:
-            timestampped_text_to_match_against = all_text[
-                window_start_loc : window_start_loc + window_size
-            ]
+            timestampped_text_to_match_against = all_text[window_start_loc : window_start_loc + window_size]
             searched_start_locs.append(window_start_loc)
             start_locs_similarity_scores.append(
                 cosine(
                     sample_hist,
-                    encode_text_window(
-                        timestampped_text_to_match_against, dictionary, dict_weights
-                    ),
+                    encode_text_window(timestampped_text_to_match_against, dictionary, dict_weights),
                 )
             )
 
@@ -154,10 +142,7 @@ def get_estimated_audio_lag(
         merged = False
         for idx, existing_range in enumerate(ranges_to_fine_search):
             # If open is within an existing range
-            if (
-                new_range_start_loc > existing_range[0]
-                and new_range_start_loc <= existing_range[1]
-            ):
+            if new_range_start_loc > existing_range[0] and new_range_start_loc <= existing_range[1]:
                 # extend the end of this range with the right most one of the two ranges
                 ranges_to_fine_search[idx] = [
                     existing_range[0],
@@ -166,10 +151,7 @@ def get_estimated_audio_lag(
                 merged = True
 
             # If end is within an existing range
-            if (
-                new_range_end_loc >= existing_range[0]
-                and new_range_end_loc < existing_range[1]
-            ):
+            if new_range_end_loc >= existing_range[0] and new_range_end_loc < existing_range[1]:
                 # extend the start of this range with the left most one of the two ranges
                 ranges_to_fine_search[idx] = [
                     min(new_range_start_loc, existing_range[0]),
@@ -214,8 +196,7 @@ def get_estimated_audio_lag(
         # relative to text matchong location within that sample
         if transcript_approx_slice_first_idx < len(reference_time_index[1]) - 1:
             relative_loc_into_slice = (
-                match_window_start_loc
-                - reference_time_index[1][transcript_approx_slice_first_idx]
+                match_window_start_loc - reference_time_index[1][transcript_approx_slice_first_idx]
             ) / (
                 reference_time_index[2][transcript_approx_slice_first_idx]
                 - reference_time_index[1][transcript_approx_slice_first_idx]
@@ -226,14 +207,11 @@ def get_estimated_audio_lag(
             )
             relative_time_into_slice = relative_loc_into_slice * total_slice_time_length
             transcript_approx_timestamp = (
-                reference_time_index[0][transcript_approx_slice_first_idx]
-                + relative_time_into_slice
+                reference_time_index[0][transcript_approx_slice_first_idx] + relative_time_into_slice
             )
         # or fallback to the time stamp of this last slice
         else:
-            transcript_approx_timestamp = reference_time_index[0][
-                transcript_approx_slice_first_idx
-            ]
+            transcript_approx_timestamp = reference_time_index[0][transcript_approx_slice_first_idx]
 
         sample_approx_timestamp = sample_split_start_at_time
         estimated_audio_lag = transcript_approx_timestamp - sample_approx_timestamp
@@ -290,18 +268,10 @@ def guess_audio_lag_behind_reference_transcript(
     # we could infer the expected mininal audio lag by looking at the difference.
     # This is not accurate - but should allow a better way to filter out outliers due
     # to bad sample matching cases
-    estimated_minimal_audio_lag = (
-        total_transcription_length_seconds - total_audio_recording_length_seconds
-    )
-    lower_audio_lag_limit = (
-        estimated_minimal_audio_lag - initial_audio_lag__estimation_buffer_size_secs
-    )
-    upper_audio_lag_limit = (
-        estimated_minimal_audio_lag + initial_audio_lag__estimation_buffer_size_secs
-    )
-    print(
-        f"Considering lag Estimations in the range: {lower_audio_lag_limit:.2f} - {upper_audio_lag_limit:.2f} secs."
-    )
+    estimated_minimal_audio_lag = total_transcription_length_seconds - total_audio_recording_length_seconds
+    lower_audio_lag_limit = estimated_minimal_audio_lag - initial_audio_lag__estimation_buffer_size_secs
+    upper_audio_lag_limit = estimated_minimal_audio_lag + initial_audio_lag__estimation_buffer_size_secs
+    print(f"Considering lag Estimations in the range: {lower_audio_lag_limit:.2f} - {upper_audio_lag_limit:.2f} secs.")
 
     estimated_lags = []
     estimaged_lags_within_probable_range = None
@@ -321,9 +291,7 @@ def guess_audio_lag_behind_reference_transcript(
             continue
 
         ts_sample_split_segs = split_transcript["segments"]
-        sample_split_text = re.sub(
-            r"[\s,.?]+", " ", "".join([seg["text"] for seg in ts_sample_split_segs])
-        )
+        sample_split_text = re.sub(r"[\s,.?]+", " ", "".join([seg["text"] for seg in ts_sample_split_segs]))
         if len(sample_split_text) < minimal_split_text_length_to_use:
             # Too short (text len wise) splits are skipped - they are too expensive and may not be specific enough
             continue
@@ -344,11 +312,7 @@ def guess_audio_lag_behind_reference_transcript(
             estimated_lags.append(estimated_lag)
 
         estimaged_lags_within_probable_range = np.asarray(
-            [
-                lag
-                for lag in estimated_lags
-                if lower_audio_lag_limit <= lag <= upper_audio_lag_limit
-            ]
+            [lag for lag in estimated_lags if lower_audio_lag_limit <= lag <= upper_audio_lag_limit]
         )
 
         if len(
@@ -398,10 +362,7 @@ def get_transcript_for_time_range(
     # Cannot get an inclusive time range from the index
     if end_range_idx - start_range_idx == 0:
         # If start is within the index, then we can get the closest one
-        if (
-            start_time_with_buffer >= ts_index[0, 0]
-            and start_time_with_buffer <= ts_index[0, -1]
-        ):
+        if start_time_with_buffer >= ts_index[0, 0] and start_time_with_buffer <= ts_index[0, -1]:
             # Get the closest one
             start_range_idx = np.abs(ts_index[0] - start_time_with_buffer).argmin()
             end_range_idx = start_range_idx + 1
@@ -414,16 +375,12 @@ def get_transcript_for_time_range(
         np.max(ts_index[1, start_range_idx : end_range_idx + 1]),
     )
 
-    split_below, split_above = get_approximate_text_split_points(
-        text_split_points, *segment_split_points
-    )
+    split_below, split_above = get_approximate_text_split_points(text_split_points, *segment_split_points)
 
     return text[split_below:split_above]
 
 
-def encode_text_window(
-    text_window: str, char_dict: dict[str, int], dict_weights: np.ndarray
-) -> np.ndarray:
+def encode_text_window(text_window: str, char_dict: dict[str, int], dict_weights: np.ndarray) -> np.ndarray:
     # calculate the "histogram" over the dictionary as the X axis
     window_hist = np.zeros(len(char_dict))
     window_sum = 0
@@ -531,9 +488,7 @@ def find_exact_ref_edges(
     ## Find Lower Bound in ref
 
     # Find where the split of the query edge should be taken from
-    valid_split_points_idx_for_lower_edge = (
-        query_snippet_split_points - minimal_edge_split_text_len >= 0
-    ).nonzero()[0]
+    valid_split_points_idx_for_lower_edge = (query_snippet_split_points - minimal_edge_split_text_len >= 0).nonzero()[0]
     if valid_split_points_idx_for_lower_edge.size > 0:
         lower_edge_split_idx = valid_split_points_idx_for_lower_edge[0]
         query_lower_edge_take_to = query_snippet_split_points[lower_edge_split_idx]
@@ -544,9 +499,7 @@ def find_exact_ref_edges(
     query_lower_edge = query_text[:query_lower_edge_take_to]
     lower_edge_hist = encode_text_window(query_lower_edge, char_dict, dict_weights)
     if lower_edge_hist is not None:
-        lower_edge_anchor_aplit_idx_on_ref = find_nearest_idx(
-            ref_snippet_split_points, index_mapping_of_ref_to_qry[0]
-        )
+        lower_edge_anchor_aplit_idx_on_ref = find_nearest_idx(ref_snippet_split_points, index_mapping_of_ref_to_qry[0])
         lower_ref_split_point_idx = find_matching_edge(
             lower_edge_anchor_aplit_idx_on_ref,
             lower_edge_hist,
@@ -575,9 +528,7 @@ def find_exact_ref_edges(
     query_upper_edge = query_text[query_upper_edge_take_from:]
     upper_edge_hist = encode_text_window(query_upper_edge, char_dict, dict_weights)
     if upper_edge_hist is not None:
-        upper_edge_anchor_aplit_idx_on_ref = find_nearest_idx(
-            ref_snippet_split_points, index_mapping_of_ref_to_qry[-1]
-        )
+        upper_edge_anchor_aplit_idx_on_ref = find_nearest_idx(ref_snippet_split_points, index_mapping_of_ref_to_qry[-1])
         upper_ref_split_point_idx = find_matching_edge(
             upper_edge_anchor_aplit_idx_on_ref,
             upper_edge_hist,
@@ -593,9 +544,7 @@ def find_exact_ref_edges(
     return (
         ref_snippet_split_points[lower_ref_split_point_idx],
         # Include the last splitted text
-        ref_snippet_split_points[
-            min(upper_ref_split_point_idx + 1, len(ref_snippet_split_points) - 1)
-        ],
+        ref_snippet_split_points[min(upper_ref_split_point_idx + 1, len(ref_snippet_split_points) - 1)],
     )
 
 
@@ -670,9 +619,7 @@ def align_split(
         is_fallback = True
 
     if not is_fallback:
-        qury_embedding = encode_text_stream(
-            split_qry_text, args.text_hist_window_size, char_dict, char_dict_weights
-        )
+        query_embedding = encode_text_stream(split_qry_text, args.text_hist_window_size, char_dict, char_dict_weights)
         ref_embedding = encode_text_stream(
             ref_text_around_split,
             args.text_hist_window_size,
@@ -682,7 +629,7 @@ def align_split(
 
         # Match query onto reference
         alignment = dtw(
-            qury_embedding,
+            query_embedding,
             ref_embedding,
             keep_internals=False,
             dist_method="cosine",
@@ -701,15 +648,13 @@ def align_split(
             char_dict_weights,
         )
 
-        final_snippet = ref_text_around_split[
-            start_to_pick_from_ref:end_to_pick_from_ref
-        ].strip()
+        final_snippet = ref_text_around_split[start_to_pick_from_ref:end_to_pick_from_ref].strip()
 
         if not final_snippet:
             is_fallback = True
         else:
             final_alignment = dtw(
-                qury_embedding,
+                query_embedding,
                 ref_embedding,
                 keep_internals=True,
                 dist_method="correlation",
@@ -723,6 +668,7 @@ def align_split(
         is_fallback = True
 
     return {
+        "split_idx": split_transcript["split_idx"],
         "base": split_qry_text,
         "reference": ref_text_around_split,
         "aligned": final_snippet,
@@ -733,10 +679,7 @@ def align_split(
 
 def align(args):
     output_transcripts_folder = pathlib.Path(args.transcripts_file).parent
-    output_transcripts_file = (
-        output_transcripts_folder
-        / f"{pathlib.Path(args.transcripts_file).stem}.aligned.json"
-    )
+    output_transcripts_file = output_transcripts_folder / f"{pathlib.Path(args.transcripts_file).stem}.aligned.json"
 
     # If output transcript file exists - no need to reprocess
     if output_transcripts_file.exists():
@@ -766,9 +709,7 @@ def align(args):
     text_natural_split_points = find_split_points(reference_text)
 
     # Character dictionary for corpus
-    char_dict, char_dict_weights = generate_transcription_character_dictionary(
-        reference_text
-    )
+    char_dict, char_dict_weights = generate_transcription_character_dictionary(reference_text)
 
     # Go over all splits
     aligned_transcripts = []
@@ -782,9 +723,7 @@ def align(args):
         char_dict,
         char_dict_weights,
     )
-    print(
-        f"Guessed audio lag: {guessed_audio_lag}sec (how much audio is behind reference text)"
-    )
+    print(f"Guessed audio lag: {guessed_audio_lag}sec (how much audio is behind reference text)")
 
     if args.transcripts_split_id is not None:
         print(f"Processing specifically split {args.transcripts_split_id}")
@@ -823,9 +762,7 @@ def align(args):
 
 if __name__ == "__main__":
     # Define an argument parser
-    parser = argparse.ArgumentParser(
-        description="""Align external transcription with split transcriptions"""
-    )
+    parser = argparse.ArgumentParser(description="""Align external transcription with split transcriptions""")
 
     # Add the arguments
     parser.add_argument(

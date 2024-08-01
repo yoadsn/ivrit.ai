@@ -94,18 +94,12 @@ class TranscriptionVerboseJsonResponse(BaseModel):
     segments: list[SegmentObject]
 
     @classmethod
-    def from_segment(
-        cls, segment: Segment, transcription_info: TranscriptionInfo
-    ) -> TranscriptionVerboseJsonResponse:
+    def from_segment(cls, segment: Segment, transcription_info: TranscriptionInfo) -> TranscriptionVerboseJsonResponse:
         return cls(
             language=transcription_info.language,
             duration=segment.end - segment.start,
             text=segment.text,
-            words=(
-                [WordObject.from_word(word) for word in segment.words]
-                if isinstance(segment.words, list)
-                else []
-            ),
+            words=([WordObject.from_word(word) for word in segment.words] if isinstance(segment.words, list) else []),
             segments=[SegmentObject.from_segment(segment)],
         )
 
@@ -118,16 +112,14 @@ class TranscriptionVerboseJsonResponse(BaseModel):
             duration=transcription_info.duration,
             text=segments_text(segments),
             segments=[SegmentObject.from_segment(segment) for segment in segments],
-            words=[
-                WordObject.from_word(word) for word in words_from_segments(segments)
-            ],
+            words=[WordObject.from_word(word) for word in words_from_segments(segments)],
         )
 
 
 class CreateTranscriptionRequest(BaseModel):
     file: bytes = Field(
         ...,
-        description="The audio file object (not file name) to transcribe, in one of these formats: flac, mp3, mp4, mpeg, mpga, m4a, ogg, wav, or webm.",
+        description="The audio file object (not file name) to transcribe, in one of the supported ffmpeg source format.",
     )
     model: str = Field(
         ...,
@@ -168,6 +160,4 @@ def segments_to_response(
     elif response_format == ResponseFormat.JSON:
         return TranscriptionJsonResponse.from_segments(segments)
     elif response_format == ResponseFormat.VERBOSE_JSON:
-        return TranscriptionVerboseJsonResponse.from_segments(
-            segments, transcription_info
-        )
+        return TranscriptionVerboseJsonResponse.from_segments(segments, transcription_info)

@@ -30,27 +30,19 @@ base_kenesset_url = "https://online.knesset.gov.il"
 base_knesset_app_url = f"{base_kenesset_url}/app"
 plenum_player_site_base_url = f"{base_kenesset_url}/app/#/player/peplayer.aspx"
 knesset_protocol_ajax_api_base_url = f"{base_kenesset_url}/api/Protocol"
-knesset_protocol_video_path_api_url = (
-    f"{knesset_protocol_ajax_api_base_url}/GetVideoPath"
-)
-knesset_protocol_html_ts_map_api_url = (
-    f"{knesset_protocol_ajax_api_base_url}/WriteBKArrayData"
-)
-knesset_protocol_page_count_api_url = (
-    f"{knesset_protocol_ajax_api_base_url}/GetBlunkCount"
-)
-knesset_protocol_page_content_api_url = (
-    f"{knesset_protocol_ajax_api_base_url}/GetProtocolBulk"
-)
+knesset_protocol_video_path_api_url = f"{knesset_protocol_ajax_api_base_url}/GetVideoPath"
+knesset_protocol_html_ts_map_api_url = f"{knesset_protocol_ajax_api_base_url}/WriteBKArrayData"
+knesset_protocol_page_count_api_url = f"{knesset_protocol_ajax_api_base_url}/GetBlunkCount"
+knesset_protocol_page_content_api_url = f"{knesset_protocol_ajax_api_base_url}/GetProtocolBulk"
 
 # Custom Scraping target for committee data discovery
 base_knesset_committee_url = "https://main.knesset.gov.il/"
-committee_broadcast_player_page_base_url = f"{base_knesset_committee_url}/Activity/committees/Finance/Pages/CommitteeTVarchive.aspx"
+committee_broadcast_player_page_base_url = (
+    f"{base_knesset_committee_url}/Activity/committees/Finance/Pages/CommitteeTVarchive.aspx"
+)
 
 # Parliament Odata service data discovery
-parliament_service_odata_manifest_url = (
-    "http://knesset.gov.il/Odata/ParliamentInfo.svc/"
-)
+parliament_service_odata_manifest_url = "http://knesset.gov.il/Odata/ParliamentInfo.svc/"
 committee_protocol_document_type_id = 23
 
 # EType Time Stampped Word-Doc structure
@@ -94,12 +86,10 @@ def load_http_headers(args) -> dict:
             http_headers_manual_data = f.read()
 
             return {
-                "User-Agent": extract_header_user_agent.search(
-                    http_headers_manual_data
-                ).group(1),
-                "Cookie": extract_header_cookie.search(http_headers_manual_data).group(
-                    1
-                ),
+                "User-Agent": extract_header_user_agent.search(http_headers_manual_data).group(1),
+                "Cookie": extract_header_cookie.search(http_headers_manual_data).group(1),
+                "Referer": "https://online.knesset.gov.il/app",
+                "Host": "online.knesset.gov.il",
             }
 
 
@@ -113,9 +103,7 @@ def check_http_access(knesset_http_headers: dict):
         print("Requesting main site page...")
         print("Using HTTP headers:")
         print(json.dumps(knesset_http_headers, indent=2))
-        response = requests.get(
-            f"{base_knesset_app_url}/", headers=knesset_http_headers
-        )
+        response = requests.get(f"{base_knesset_app_url}/", headers=knesset_http_headers)
         if response.status_code == 200:
             print("200 response recieved")
             # if the HTML content contains a <title> tag
@@ -164,9 +152,7 @@ def create_parliament_odata_client() -> pyodata.Client:
     # Use older "2" version of odata since the client does not support
     # "3" which is the current server supported version
     http_session.headers["MaxDataServiceVersion"] = "2.0"
-    pareliamentInfoService = pyodata.Client(
-        parliament_service_odata_manifest_url, http_session
-    )
+    pareliamentInfoService = pyodata.Client(parliament_service_odata_manifest_url, http_session)
 
     return pareliamentInfoService
 
@@ -199,9 +185,7 @@ def extract_transcript_parts_from_elements(root_element: PageElement, context: d
 
         # get the id - find the time context
         if "id" in root_element.attrs:
-            text_idx_matches = plenum_html_text_idx_extractor_pattern.findall(
-                root_element["id"]
-            )
+            text_idx_matches = plenum_html_text_idx_extractor_pattern.findall(root_element["id"])
             text_ts_idx = None
 
             if len(text_idx_matches) > 0:
@@ -209,9 +193,7 @@ def extract_transcript_parts_from_elements(root_element: PageElement, context: d
 
             if text_ts_idx is not None:
                 prev_text_ts: pd.Timedelta = context["current_text_ts"]
-                time_at_idx: pd.Timedelta = pd.to_timedelta(
-                    context["time_pointers_arr_np"][text_ts_idx], "s"
-                )
+                time_at_idx: pd.Timedelta = pd.to_timedelta(context["time_pointers_arr_np"][text_ts_idx], "s")
 
                 if prev_text_ts is None or context["current_text_ts"] < time_at_idx:
                     context["current_text_ts"] = time_at_idx
@@ -221,11 +203,7 @@ def extract_transcript_parts_from_elements(root_element: PageElement, context: d
                     ]
 
                 # if we moved to a new TS - add an end marker before the begin marker
-                if (
-                    prev_text_ts is not None
-                    and prev_text_ts.total_seconds() > 0
-                    and prev_text_ts < time_at_idx
-                ):
+                if prev_text_ts is not None and prev_text_ts.total_seconds() > 0 and prev_text_ts < time_at_idx:
                     extracted_list = [
                         TimeMarker(False, prev_text_ts.total_seconds()),
                         *extracted_list,
@@ -262,9 +240,7 @@ def extract_transcript_parts_from_elements(root_element: PageElement, context: d
     elif root_element.name == "br":
         return ["\n"]
     else:
-        raise ValueError(
-            f"What should I do with type: {type(root_element)} and str: {str(root_element)}"
-        )
+        raise ValueError(f"What should I do with type: {type(root_element)} and str: {str(root_element)}")
 
 
 def parse_plenum_transcript(content, time_pointers_arr_np) -> tuple[str, pd.DataFrame]:
@@ -277,18 +253,11 @@ def parse_plenum_transcript(content, time_pointers_arr_np) -> tuple[str, pd.Data
         "latest_closed_ts_marker": 0,
     }
     root_element = soup.find("div", {"id": "root"})
-    page_text_parts.extend(
-        extract_transcript_parts_from_elements(root_element, extraction_context)
-    )
+    page_text_parts.extend(extract_transcript_parts_from_elements(root_element, extraction_context))
 
     # Ensure last marker is proplely closed
-    if (
-        extraction_context["latest_closed_ts_marker"]
-        < extraction_context["current_text_ts"]
-    ):
-        page_text_parts.append(
-            TimeMarker(False, extraction_context["current_text_ts"].total_seconds())
-        )
+    if extraction_context["latest_closed_ts_marker"] < extraction_context["current_text_ts"]:
+        page_text_parts.append(TimeMarker(False, extraction_context["current_text_ts"].total_seconds()))
 
     # Seperate text parts from to text and time index
     text_timestamp_index = {}
@@ -334,9 +303,7 @@ def close_prev_committee_time_marker(
     # Close previous marker.
     # Internal time marker bookmarks are not capturing text - the "range end"
     # of one is actually the beginning of another.
-    end_time_marker = TimeMarker(
-        start=False, seconds=time_stamp, id=last_marker_bookmark_id
-    )
+    end_time_marker = TimeMarker(start=False, seconds=time_stamp, id=last_marker_bookmark_id)
     text_parts.append(end_time_marker)
 
     # If the closed range does not contain any text
@@ -391,9 +358,7 @@ def parse_committee_timestampped_protocol_doc(
 
     # Dump entire XML doc to a readable file
     # Mainly for debug purposes or downstream post processing
-    with open(
-        committee_id_target_folder / cached_protocol_doc_xml_content_file_name, "w"
-    ) as f:
+    with open(committee_id_target_folder / cached_protocol_doc_xml_content_file_name, "w") as f:
         f.write(document.element.xml)
 
     for _parag in document.paragraphs:
@@ -412,13 +377,9 @@ def parse_committee_timestampped_protocol_doc(
                         range_start_time_stamp = None
 
                     text_length_in_timestampped_range = 0
-                    range_start_time_stamp = (
-                        int(c.name.split(etype_time_bookmark_split_pattern)[1]) / 1000.0
-                    )
+                    range_start_time_stamp = int(c.name.split(etype_time_bookmark_split_pattern)[1]) / 1000.0
                     time_marker_bookmark_id = c.id
-                    start_time_marker = TimeMarker(
-                        start=True, seconds=range_start_time_stamp, id=c.id
-                    )
+                    start_time_marker = TimeMarker(start=True, seconds=range_start_time_stamp, id=c.id)
                     main_text_gather.append(start_time_marker)
                 elif etype_bookmark_name_matcher.match(c.name):
                     ancillary_text_bookmark_id = c.id
@@ -433,9 +394,7 @@ def parse_committee_timestampped_protocol_doc(
                 # the text, sometimes is wrongly not wrapped in a bookmark although
                 # it describes a speaker (for example)
                 # Check this for extra cleaning
-                is_bookmark_like_text_pattern = (
-                    etype_missed_bookmark_text_pattern.search(str(c.text))
-                )
+                is_bookmark_like_text_pattern = etype_missed_bookmark_text_pattern.search(str(c.text))
                 need_to_close_line_in_ancillary_text = False
                 if is_bookmark_like_text_pattern and ancillary_text_bookmark_id is None:
                     if forced_ancillary_text_range_pattern:
@@ -448,9 +407,7 @@ def parse_committee_timestampped_protocol_doc(
                     forced_ancillary_text_range_pattern or is_bookmark_like_text_pattern
                 ):
                     main_text_gather.append(c.text)
-                    text_length_in_timestampped_range += len(
-                        normalize_text_as_caption_text(c.text)
-                    )
+                    text_length_in_timestampped_range += len(normalize_text_as_caption_text(c.text))
                     had_text_parts = True
                 else:
                     ancillary_text_gather.append(c.text)
@@ -539,16 +496,12 @@ def parse_committee_timestampped_protocol_doc(
                 and to_merge_start_marker_idx is not None
                 and to_merge_end_marker_idx is not None
             ):
-                anchor_len_seconds = (
-                    to_merge_start_marker_seconds - anchor_start_marker_seconds
-                )
+                anchor_len_seconds = to_merge_start_marker_seconds - anchor_start_marker_seconds
                 if (
                     anchor_len_seconds >= 0 and anchor_len_seconds < 3  # Too short
                 ) or not to_merge_marker_contains_non_whitespace:  # Only whitespaces
                     # "Swallow" the to_merge segment by moving the anchor end to the end
-                    main_text_gather[to_merge_end_marker_idx] = main_text_gather[
-                        anchor_end_marker_idx
-                    ]
+                    main_text_gather[to_merge_end_marker_idx] = main_text_gather[anchor_end_marker_idx]
                     # Replace two mid markers with spaces to keep the list indexing proper
                     main_text_gather[anchor_end_marker_idx] = ""
                     main_text_gather[to_merge_start_marker_idx] = ""
@@ -654,11 +607,7 @@ def create_recording_transcript_vtt(text: str, time_index: pd.DataFrame) -> WebV
                 merge_start_loc = None
 
             text_range_slice = slice(int(slice_start_loc), int(data["end_loc"]))
-            vtt.captions.append(
-                create_caption(
-                    text[text_range_slice], data["timestamp"], data["next_ts"]
-                )
-            )
+            vtt.captions.append(create_caption(text[text_range_slice], data["timestamp"], data["next_ts"]))
     return vtt
 
 
@@ -678,17 +627,13 @@ def cleanup_html_time_map_arr(time_map_arr: np.ndarray) -> np.ndarray:
             time_map_arr[ith] - time_map_arr[ith + 1] > max_backwards_jump
         ):  # backwards time jump - over tolerance - fix it
             time_map_arr[ith + 1] = time_map_arr[ith]
-        elif (
-            time_map_arr[ith + 1] - time_map_arr[ith] > max_forward_jump
-        ):  # Forward jump is too big - fix it
+        elif time_map_arr[ith + 1] - time_map_arr[ith] > max_forward_jump:  # Forward jump is too big - fix it
             # Skip the bad value and look forward a bit to get an estimate
             # of where the series continues
             future_baseline = np.median(time_map_arr[ith + 2 : ith + 10 : 2])
             # If the next value is closer to the future baseline - use it
             # despite it being an abnormal jump - perhaps this jump is required.
-            if abs(time_map_arr[ith + 1] - future_baseline) < abs(
-                time_map_arr[ith] - future_baseline
-            ):
+            if abs(time_map_arr[ith + 1] - future_baseline) < abs(time_map_arr[ith] - future_baseline):
                 continue
 
             # Otherwise - fix it by taking the max allowed jump
@@ -703,12 +648,8 @@ def get_plenum_video_resource_url(
     plenum_recording_id: str,
 ) -> str:
     # If the video file url is cached - use that
-    if pathlib.Path(
-        plenum_id_target_folder / cached_video_source_url_file_name
-    ).exists():
-        with open(
-            plenum_id_target_folder / cached_video_source_url_file_name, "r"
-        ) as f:
+    if pathlib.Path(plenum_id_target_folder / cached_video_source_url_file_name).exists():
+        with open(plenum_id_target_folder / cached_video_source_url_file_name, "r") as f:
             video_resource_url = f.read()
     else:
         # Get the video path
@@ -720,9 +661,7 @@ def get_plenum_video_resource_url(
         video_resource_url = json.loads(response.text)
 
         # cache the url
-        with open(
-            plenum_id_target_folder / cached_video_source_url_file_name, "w"
-        ) as f:
+        with open(plenum_id_target_folder / cached_video_source_url_file_name, "w") as f:
             f.write(video_resource_url)
 
     return video_resource_url
@@ -734,33 +673,21 @@ def get_committee_video_resource_url(
     committee_session_id: str,
 ) -> str:
     # If the video file url is cached - use that
-    if pathlib.Path(
-        committee_id_target_folder / cached_video_source_url_file_name
-    ).exists():
-        with open(
-            committee_id_target_folder / cached_video_source_url_file_name, "r"
-        ) as f:
+    if pathlib.Path(committee_id_target_folder / cached_video_source_url_file_name).exists():
+        with open(committee_id_target_folder / cached_video_source_url_file_name, "r") as f:
             video_resource_url = f.read()
     else:
         print("Resolving committee session TopicID.")
         # Get the TopicID of the session - this identifies
         # the page that contains the MPEG-dash manifest URL
         odata_client = create_parliament_odata_client()
-        committee_session_entity = (
-            odata_client.entity_sets.KNS_CommitteeSession.get_entity(
-                int(committee_session_id)
-            ).execute()
-        )
+        committee_session_entity = odata_client.entity_sets.KNS_CommitteeSession.get_entity(
+            int(committee_session_id)
+        ).execute()
         video_recording_view_page_path = urlparse(committee_session_entity.BroadcastUrl)
-        video_recording_topic_id = parse_qs(video_recording_view_page_path.query).get(
-            "TopicID", None
-        )
+        video_recording_topic_id = parse_qs(video_recording_view_page_path.query).get("TopicID", None)
         # this URL is actually broken - we only take the session topic id from it.
-        video_recording_topic_id = (
-            video_recording_topic_id[0]
-            if video_recording_topic_id is not None
-            else None
-        )
+        video_recording_topic_id = video_recording_topic_id[0] if video_recording_topic_id is not None else None
 
         # Prepare the page we will scrape for the mpeg-dash manifest URL
         # Apparently - the "folder" of the committee does not matter - the "TopicID" works anyway. (hmm)
@@ -777,9 +704,7 @@ def get_committee_video_resource_url(
         soup = BeautifulSoup(broadcast_pointer_page_html_content.content, "html.parser")
 
         broadcast_js_call_matcher = re.compile(r"javascript:SetAzurePlayerFileName")
-        broadcast_video_feed_extractor = re.compile(
-            r"javascript:SetAzurePlayerFileName\('(.*?)',"
-        )
+        broadcast_video_feed_extractor = re.compile(r"javascript:SetAzurePlayerFileName\('(.*?)',")
 
         # We need to find a node that is an anchor and point to a JS call looking like this:
         # <a href="javascript:SetAzurePlayerFileName(
@@ -788,16 +713,12 @@ def get_committee_video_resource_url(
             href=broadcast_js_call_matcher,
         )
         js_func_call_href = anchor_elem.attrs["href"]
-        video_resource_url = broadcast_video_feed_extractor.match(
-            js_func_call_href
-        ).group(1)
+        video_resource_url = broadcast_video_feed_extractor.match(js_func_call_href).group(1)
 
         # Found the Video Feed - this is an MPEG-Dash MPD file
 
         # cache the url
-        with open(
-            committee_id_target_folder / cached_video_source_url_file_name, "w"
-        ) as f:
+        with open(committee_id_target_folder / cached_video_source_url_file_name, "w") as f:
             f.write(video_resource_url)
 
     return video_resource_url
@@ -811,9 +732,7 @@ def get_html_ts_map(
     # check if a cache file of the HTML TS map exists
     if pathlib.Path(plenum_id_target_folder / cached_html_ts_map_file_name).exists():
         print("Reusing cached HTML->Timestamp mapping...")
-        html_ts_map_js_array = np.load(
-            plenum_id_target_folder / cached_html_ts_map_file_name
-        )
+        html_ts_map_js_array = np.load(plenum_id_target_folder / cached_html_ts_map_file_name)
     else:
         print("Loading HTML->Timestamp mapping...")
 
@@ -822,9 +741,7 @@ def get_html_ts_map(
             f"{knesset_protocol_html_ts_map_api_url}?sProtocolNum={plenum_recording_id}",
             headers=knesset_http_headers,
         )
-        html_ts_map_js_array = np.array(
-            json.loads(node_id_timestamp_mapping_response.text)
-        )
+        html_ts_map_js_array = np.array(json.loads(node_id_timestamp_mapping_response.text))
 
         print("Cleaning up the HTML-Timestamp mapping...")
         html_ts_map_js_array = cleanup_html_time_map_arr(html_ts_map_js_array)
@@ -844,13 +761,9 @@ def get_html_transcript(
     plenum_recording_id: str,
 ):
     # If a temp HTML traanscript file exists, use that
-    if pathlib.Path(
-        plenum_id_target_folder / cached_transcript_html_file_name
-    ).exists():
+    if pathlib.Path(plenum_id_target_folder / cached_transcript_html_file_name).exists():
         print("Reusing cached transcript HTML file from previouse run")
-        with open(
-            plenum_id_target_folder / cached_transcript_html_file_name, "r"
-        ) as transcript_html_file:
+        with open(plenum_id_target_folder / cached_transcript_html_file_name, "r") as transcript_html_file:
             html_transcript = transcript_html_file.read()
     else:
         # Load how many content pages exists
@@ -875,9 +788,7 @@ def get_html_transcript(
             pages_content.append(page_content)
 
         # Process all page contents into an output HTML snippet
-        output_html_parts = [
-            page_content.get("sContent") for page_content in pages_content
-        ]
+        output_html_parts = [page_content.get("sContent") for page_content in pages_content]
         html_transcript_snippet = "".join(output_html_parts)
         html_transcript = f'<div id="root">{html_transcript_snippet}</div>'
 
@@ -893,24 +804,16 @@ def get_committee_protocol_doc_url(
     committee_session_id: str,
 ) -> str:
     # If the protocol doc file url is cached - use that
-    if pathlib.Path(
-        committee_id_target_folder / cached_protocol_doc_source_url_file_name
-    ).exists():
-        with open(
-            committee_id_target_folder / cached_protocol_doc_source_url_file_name, "r"
-        ) as f:
+    if pathlib.Path(committee_id_target_folder / cached_protocol_doc_source_url_file_name).exists():
+        with open(committee_id_target_folder / cached_protocol_doc_source_url_file_name, "r") as f:
             protocol_doc_download_path = f.read()
     else:
         odata_client = create_parliament_odata_client()
-        committee_session_docs_query = (
-            odata_client.entity_sets.KNS_DocumentCommitteeSession.get_entities()
-        )
+        committee_session_docs_query = odata_client.entity_sets.KNS_DocumentCommitteeSession.get_entities()
         committee_session_docs_query = committee_session_docs_query.filter(
             esf.and_(
-                committee_session_docs_query.CommitteeSessionID
-                == int(committee_session_id),
-                committee_session_docs_query.GroupTypeID
-                == committee_protocol_document_type_id,
+                committee_session_docs_query.CommitteeSessionID == int(committee_session_id),
+                committee_session_docs_query.GroupTypeID == committee_protocol_document_type_id,
             )
         )
 
@@ -935,9 +838,7 @@ def get_commitee_protocol_doc(
     protocol_doc_download_url: str,
 ):
     # If the protocol doc is cached - use that
-    if pathlib.Path(
-        committee_id_target_folder / cached_protocol_doc_file_name
-    ).exists():
+    if pathlib.Path(committee_id_target_folder / cached_protocol_doc_file_name).exists():
         return
 
     # Download the protocol doc
@@ -1050,31 +951,21 @@ def download_plenum(
     if not pathlib.Path(plenum_id_target_folder).exists():
         plenum_id_target_folder.mkdir(parents=True, exist_ok=True)
 
-    video_resource_url = get_plenum_video_resource_url(
-        knesset_http_headers, plenum_id_target_folder, id
-    )
+    video_resource_url = get_plenum_video_resource_url(knesset_http_headers, plenum_id_target_folder, id)
 
     print(f"Plenum video resource url: {video_resource_url} (Not downloading yet..)")
 
-    html_ts_map_js_array = get_html_ts_map(
-        knesset_http_headers, plenum_id_target_folder, id
-    )
+    html_ts_map_js_array = get_html_ts_map(knesset_http_headers, plenum_id_target_folder, id)
 
-    html_transcript = get_html_transcript(
-        knesset_http_headers, plenum_id_target_folder, id
-    )
+    html_transcript = get_html_transcript(knesset_http_headers, plenum_id_target_folder, id)
 
     print("Parsing HTML transcript...")
-    transcript_text, transcript_time_index_df = parse_plenum_transcript(
-        html_transcript, html_ts_map_js_array
-    )
+    transcript_text, transcript_time_index_df = parse_plenum_transcript(html_transcript, html_ts_map_js_array)
 
     # Store the output artifacts
     with open(plenum_id_target_folder / output_transcript_text_file_name, "w") as f:
         f.write(transcript_text)
-    transcript_time_index_df.to_csv(
-        plenum_id_target_folder / output_transcript_time_index_file_name
-    )
+    transcript_time_index_df.to_csv(plenum_id_target_folder / output_transcript_time_index_file_name)
 
     print("Creating a VTT file of the transcript...")
     vtt = create_recording_transcript_vtt(transcript_text, transcript_time_index_df)
@@ -1104,39 +995,27 @@ def download_committee_session(
     if not pathlib.Path(committee_id_target_folder).exists():
         committee_id_target_folder.mkdir(parents=True, exist_ok=True)
 
-    video_resource_url = get_committee_video_resource_url(
-        knesset_http_headers, committee_id_target_folder, session_id
-    )
+    video_resource_url = get_committee_video_resource_url(knesset_http_headers, committee_id_target_folder, session_id)
 
     print(f"Committee video resource url: {video_resource_url} (Not downloading yet..)")
 
-    protocol_doc_download_url = get_committee_protocol_doc_url(
-        committee_id_target_folder, session_id
-    )
+    protocol_doc_download_url = get_committee_protocol_doc_url(committee_id_target_folder, session_id)
 
     if protocol_doc_download_url is None:
-        print(
-            f"No protocol doc download url found. aborting download of session id: {session_id}"
-        )
+        print(f"No protocol doc download url found. aborting download of session id: {session_id}")
         return
 
-    print(
-        f"Committee protocol doc resource url: {protocol_doc_download_url}, downloading..."
-    )
+    print(f"Committee protocol doc resource url: {protocol_doc_download_url}, downloading...")
 
     get_commitee_protocol_doc(committee_id_target_folder, protocol_doc_download_url)
 
     print("Parsing protocol doc transcript...")
-    transcript_text, transcript_time_index_df = (
-        parse_committee_timestampped_protocol_doc(committee_id_target_folder)
-    )
+    transcript_text, transcript_time_index_df = parse_committee_timestampped_protocol_doc(committee_id_target_folder)
 
     # Store the output artifacts
     with open(committee_id_target_folder / output_transcript_text_file_name, "w") as f:
         f.write(transcript_text)
-    transcript_time_index_df.to_csv(
-        committee_id_target_folder / output_transcript_time_index_file_name
-    )
+    transcript_time_index_df.to_csv(committee_id_target_folder / output_transcript_time_index_file_name)
 
     print("Creating a VTT file of the transcript...")
     vtt = create_recording_transcript_vtt(transcript_text, transcript_time_index_df)
@@ -1147,9 +1026,7 @@ def download_committee_session(
     else:
         print("Skipping video file download.")
 
-    transcode_video_to_audio(
-        session_id, committee_target_folder, committee_id_target_folder
-    )
+    transcode_video_to_audio(session_id, committee_target_folder, committee_id_target_folder)
 
     print(f"Download committee session {session_id} done.")
 

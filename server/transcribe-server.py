@@ -1,6 +1,7 @@
 import argparse
 import base64
 from enum import Enum
+from http import HTTPStatus
 import io
 import os
 from threading import Semaphore
@@ -46,17 +47,15 @@ def transcribe_audio():
         if request.form.get("temperature") is not None:
             request_data.temperature = float(request.form.get("temperature"))
         if request.form.get("timestamp_granularities[]") is not None:
-            request_data.timestamp_granularities = request.form.getlist(
-                "timestamp_granularities[]"
-            )
+            request_data.timestamp_granularities = request.form.getlist("timestamp_granularities[]")
     except Exception as e:
-        return str(e), 400
+        return str(e), HTTPStatus.BAD_REQUEST
 
     if not in_flight_semaphore.acquire(blocking=False):
         return (
             jsonify({"error": "Too many tasks in flight"}),
-            429,
-        )  # HTTP 429 Too Many Requests
+            HTTPStatus.TOO_MANY_REQUESTS,
+        )
 
     try:
         # Process the task
@@ -76,17 +75,19 @@ def transcribe_audio():
                 )
 
                 # Format the response
-                response = segments_to_response(
-                    segments, transcription_info, request_data.response_format
-                )
+                response = segments_to_response(segments, transcription_info, request_data.response_format)
                 if request_data.response_format == ResponseFormat.TEXT:
-                    return response, 200, {"Content-Type": "text/plain"}
+                    return response, HTTPStatus.OK, {"Content-Type": "text/plain"}
 
                 response_json = response.model_dump_json()
-                return response_json, 200, {"Content-Type": "application/json"}
+                return (
+                    response_json,
+                    HTTPStatus.OK,
+                    {"Content-Type": "application/json"},
+                )
 
             except Exception as e:
-                return jsonify({"error": str(e)}), 500
+                return jsonify({"error": str(e)}), HTTPStatus.INTERNAL_SERVER_ERROR
 
             finally:
                 if model is not None:
@@ -94,33 +95,6 @@ def transcribe_audio():
 
     finally:
         in_flight_semaphore.release()
-
-
-@app.route("/execute", methods=["POST"])
-def execute_task():
-    if not in_flight_semaphore.acquire(blocking=False):
-        return (
-            jsonify({"error": "Too many tasks in flight"}),
-            429,
-        )  # HTTP 429 Too Many Requests
-
-    try:
-        # Extract task details
-        task = request.json
-        task_type = task.get("type")
-        data = task.get("data")
-        token = task.get("token")
-
-        # Verify token for security (optional, but recommended)
-
-        # Process the task
-        with task_semaphore:
-            result = process_task(task_type, data)
-    finally:
-        in_flight_semaphore.release()
-
-    # Return the result
-    return jsonify({"result": result})
 
 
 def process_task(task_type, data):
@@ -198,9 +172,7 @@ from the Hugging Face Hub.""",
     )
     args = parser.parse_args()
 
-    print(
-        f"Loading whisper model: {args.model}. pid={os.getpid()} tid={threading.current_thread().native_id}"
-    )
+    print(f"Loading whisper model: {args.model}. pid={os.getpid()} tid={threading.current_thread().native_id}")
 
     whisper_models = []
     for i in range(args.max_concurrent_tasks):
