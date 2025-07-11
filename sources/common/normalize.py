@@ -165,7 +165,7 @@ def normalize_entries(
     if entry_ids:
         meta_files = [mf for mf in meta_files if mf.parent.name in entry_ids]
 
-    # Pre filter any entries which do not need anhy processing
+    # Pre filter any entries which do not need any processing
     entry_count_pre_processing_filter = len(meta_files)
     any_normalizer: BaseNormalizer = normalizer_queue.get()
     meta_files = [mf for mf in meta_files if any_normalizer.should_process(mf, force_reprocess, force_rescore)]
@@ -176,6 +176,11 @@ def normalize_entries(
         else:
             print(f"No entries require processing.")
             return
+
+    max_entries = kwargs.pop("max_entries", None)
+    if max_entries is not None:
+        print(f"Normalizing only {max_entries} entries out of {len(meta_files)}")
+        meta_files = meta_files[:max_entries]
 
     # Define the worker function
     def process_entry(entry_dir):
