@@ -4,7 +4,10 @@ import pathlib
 import time
 from typing import List, Optional
 
+import torch
+
 from alignment.align import align_transcript_to_audio
+from alignment.utils import get_breakable_align_model
 from sources.common.normalize import (
     DEFAULT_ALIGN_DEVICE_DENSITY,
     DEFAULT_ALIGN_MODEL,
@@ -41,8 +44,8 @@ class CrowdRecitalNormalizer(BaseNormalizer):
     def get_language(self, metadata: SessionMetadata) -> str:
         """Get the language for the session."""
         doc_lang = metadata.document_language.lower()
-        if doc_lang != "he":
-            raise ValueError(f"Unsupported language '{doc_lang}'. Only 'he' is supported.")
+        if doc_lang not in ["he", "yi"]:
+            raise ValueError(f"Unsupported language '{doc_lang}'. Only 'he', 'yi' are supported.")
         return doc_lang
 
     def get_duration(self, metadata: SessionMetadata) -> float:
@@ -59,6 +62,21 @@ class CrowdRecitalNormalizer(BaseNormalizer):
         with open(meta_file, "w", encoding="utf-8") as f:
             f.write(metadata.model_dump_json(indent=2))
 
+    def load_model(self):
+        """Get the alignment model using get_breakable_align_model."""
+        device = self.align_device
+        if device == "auto":
+            try:
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+            except ImportError:
+                device = "cpu"
+
+        if self.model is None:
+            self.model = get_breakable_align_model(
+                self.align_model, self.align_device, "int8"  # Using int8 as the default compute type
+            )
+        return self.model
+    
     def normalize_entry(
         self,
         entry_dir: pathlib.Path,

@@ -191,7 +191,7 @@ def get_breakable_align_model(model: str, device: str, compute_type: str):
     """
     from alignment.breakable_aligner import breakable_align
 
-    device_index = None
+    device_index = 0
     if len(device.split(":")) == 2:
         device, device_index = device.split(":")
         device_index = int(device_index)

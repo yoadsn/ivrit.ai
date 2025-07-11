@@ -83,7 +83,7 @@ def add_common_normalize_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--align-devices",
-        nargs="*",
+        nargs="+",
         type=str,
         help=f"Devices for alignment. Use 'auto' to use cuda if available otherwise cpu (default: {DEFAULT_ALIGN_DEVICE}). Can specify multiple devices separated by spaces to increase parallelism.",
     )
@@ -169,6 +169,7 @@ def normalize_entries(
     entry_count_pre_processing_filter = len(meta_files)
     any_normalizer: BaseNormalizer = normalizer_queue.get()
     meta_files = [mf for mf in meta_files if any_normalizer.should_process(mf, force_reprocess, force_rescore)]
+    normalizer_queue.put(any_normalizer)
     entry_count_post_processing_filter = len(meta_files)
     if entry_count_pre_processing_filter != entry_count_post_processing_filter:
         if entry_count_post_processing_filter > 0:
@@ -340,9 +341,20 @@ class BaseNormalizer(ABC):
             except ImportError:
                 device = "cpu"
 
+        
+        device_index = 0
+        if len(device.split(":")) == 2:
+            device, device_index = device.split(":")
+            device_index = int(device_index)
+        
         # Load the alignment model with int8 quantization for memory efficiency
         try:
-            model = stable_whisper.load_faster_whisper(self.align_model, device=device, compute_type="int8")
+            model = stable_whisper.load_faster_whisper(
+                self.align_model,
+                device=device,
+                device_index=device_index,
+                compute_type="int8"
+            )
             return model
         except Exception as e:
             raise RuntimeError(f"Failed to load alignment model: {e}")
