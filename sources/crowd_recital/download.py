@@ -1,4 +1,6 @@
 import argparse
+import logging
+from logging.handlers import RotatingFileHandler
 import pathlib
 
 import boto3
@@ -167,6 +169,11 @@ def main() -> None:
         default=[],
         help="Filter to process only the specified session ids (can be specified multiple times)",
     )
+    parser.add_argument(
+        "--logs-folder",
+        type=str,
+        help="Folder to store log files. If not specified, logging is disabled.",
+    )
 
     # Add normalization-related arguments (input-folder is not needed since we use output-dir as the folder to normalize)
     add_normalize_args(parser)
@@ -175,6 +182,37 @@ def main() -> None:
 
     output_dir = pathlib.Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Configure logging based on logs_folder
+    # By default, disable all logging
+    logging.basicConfig(level=logging.CRITICAL + 1)  # Set level higher than CRITICAL to disable all logging
+
+    if hasattr(args, "logs_folder") and args.logs_folder:
+        logs_folder = pathlib.Path(args.logs_folder)
+        logs_folder.mkdir(parents=True, exist_ok=True)
+
+        # Configure root logger
+        root_logger = logging.getLogger()
+        root_logger.setLevel(logging.INFO)
+
+        # Remove any existing handlers
+        for handler in root_logger.handlers[:]:
+            root_logger.removeHandler(handler)
+
+        # Create a rotating file handler
+        log_file = logs_folder / "download_log"
+        file_handler = RotatingFileHandler(log_file, maxBytes=5 * 1024 * 1024, backupCount=5)  # 5MB
+        file_handler.setLevel(logging.INFO)
+
+        # Create formatter and add it to the handler
+        formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+        file_handler.setFormatter(formatter)
+
+        # Add the handler to the logger
+        root_logger.addHandler(file_handler)
+
+        # Log start of process
+        logging.info(f"Starting Recital download process with output directory: {output_dir}")
 
     if not args.skip_download:
         # Load sessions from PostgreSQL database
