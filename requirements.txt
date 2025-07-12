@@ -18,7 +18,7 @@ transformers
 feedparser
 openai
 python-dotenv
-psycopg==3.2.4
+psycopg[binary]==3.2.4
 jiwer
 pandas
 yt_dlp

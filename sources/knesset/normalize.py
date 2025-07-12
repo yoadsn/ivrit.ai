@@ -5,6 +5,7 @@ import time
 from typing import List, Optional
 
 import stable_whisper
+import torch
 
 from alignment.align import align_transcript_to_audio
 from alignment.utils import get_breakable_align_model
@@ -67,6 +68,13 @@ class KnessetNormalizer(BaseNormalizer):
 
     def load_model(self):
         """Get the alignment model using get_breakable_align_model."""
+        device = self.align_device
+        if device == "auto":
+            try:
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+            except ImportError:
+                device = "cpu"
+                
         if self.model is None:
             self.model = get_breakable_align_model(
                 self.align_model, self.align_device, "int8"  # Using int8 as the default compute type

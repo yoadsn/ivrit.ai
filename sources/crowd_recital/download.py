@@ -1,4 +1,6 @@
 import argparse
+import logging
+from logging.handlers import RotatingFileHandler
 import pathlib
 
 import boto3
@@ -137,12 +139,13 @@ def main() -> None:
     parser.add_argument(
         "--output-dir", type=str, required=True, help="Local output directory where sessions will be downloaded."
     )
+    parser.add_argument("--skip-download", action="store_true", help="Only normalize already downloaded sessions.")
     parser.add_argument("--force-download", action="store_true", help="Force re-download of files even if they exist.")
     parser.add_argument(
         "--max-sessions",
         type=int,
         default=None,
-        help="Maximum number of sessions to process from the database (applied before checking download state).",
+        help="Maximum number of sessions to process from the database (applied before checking download state and before normalizing).",
     )
     parser.add_argument(
         "--pg-connection-string",
@@ -166,6 +169,11 @@ def main() -> None:
         default=[],
         help="Filter to process only the specified session ids (can be specified multiple times)",
     )
+    parser.add_argument(
+        "--logs-folder",
+        type=str,
+        help="Folder to store log files. If not specified, logging is disabled.",
+    )
 
     # Add normalization-related arguments (input-folder is not needed since we use output-dir as the folder to normalize)
     add_normalize_args(parser)
@@ -175,51 +183,85 @@ def main() -> None:
     output_dir = pathlib.Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load sessions from PostgreSQL database
-    sessions = load_uploaded_sessions_from_db(args.pg_connection_string, languages=args.languages)
-    if args.session_ids:
-        sessions = [s for s in sessions if str(s.get("session_id")) in args.session_ids]
-    if args.max_sessions is not None:
-        sessions = sessions[: args.max_sessions]
-    if not sessions:
-        print("No recording sessions found in the database.")
-        return
+    # Configure logging based on logs_folder
+    # By default, disable all logging
+    logging.basicConfig(level=logging.CRITICAL + 1)  # Set level higher than CRITICAL to disable all logging
 
-    # Setup the S3 client using provided AWS credentials or default env
-    if args.aws_access_key and args.aws_secret_key:
-        s3_client = boto3.client("s3", aws_access_key_id=args.aws_access_key, aws_secret_access_key=args.aws_secret_key)
-    else:
-        s3_client = boto3.client("s3")
+    if hasattr(args, "logs_folder") and args.logs_folder:
+        logs_folder = pathlib.Path(args.logs_folder)
+        logs_folder.mkdir(parents=True, exist_ok=True)
 
-    for session in tqdm(sessions, desc="Downloading sessions"):
-        tqdm.write(
-            f"Processing session {session.get('session_id')} | Title: {session.get('document_title')} | Lang: {session.get('document_language')} | Duration: {session.get('session_duration')} | User: {session.get('user_id')} | YOB: {session.get('year_of_birth')} | Sex: {session.get('biological_sex')}"
-        )
-        download_session_data_files(
-            s3_client, args.s3_bucket, args.s3_prefix, session.get("session_id"), output_dir, args.force_download
-        )
-        # Write session metadata to metadata.json in the session output directory (always regenerated)
-        session_output_dir = output_dir / session.get("session_id")
-        metadata_file = session_output_dir / "metadata.json"
-        session_id = str(session.get("session_id"))
-        session_metadata_instance = SessionMetadata(
-            source_type=source_type,
-            source_id=source_id,
-            source_entry_id=session_id,
-            session_id=session_id,
-            session_duration=float(session.get("session_duration")),
-            user_id=str(session.get("user_id")),
-            document_language=str(session.get("document_language")),
-            document_title=str(session.get("document_title")),
-            document_source_type=str(session.get("document_source_type")),
-            year_of_birth=int(session.get("year_of_birth")) if session.get("year_of_birth") is not None else None,
-            biological_sex=session.get("biological_sex"),
-            # Possibly determined later during alignment
-            quality_score=None,
-            per_segment_quality_scores=None,
-        )
-        with open(metadata_file, "w") as f:
-            f.write(session_metadata_instance.model_dump_json(indent=2))
+        # Configure root logger
+        root_logger = logging.getLogger()
+        root_logger.setLevel(logging.INFO)
+
+        # Remove any existing handlers
+        for handler in root_logger.handlers[:]:
+            root_logger.removeHandler(handler)
+
+        # Create a rotating file handler
+        log_file = logs_folder / "download_log"
+        file_handler = RotatingFileHandler(log_file, maxBytes=5 * 1024 * 1024, backupCount=5)  # 5MB
+        file_handler.setLevel(logging.INFO)
+
+        # Create formatter and add it to the handler
+        formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+        file_handler.setFormatter(formatter)
+
+        # Add the handler to the logger
+        root_logger.addHandler(file_handler)
+
+        # Log start of process
+        logging.info(f"Starting Recital download process with output directory: {output_dir}")
+
+    if not args.skip_download:
+        # Load sessions from PostgreSQL database
+        sessions = load_uploaded_sessions_from_db(args.pg_connection_string, languages=args.languages)
+        if args.session_ids:
+            sessions = [s for s in sessions if str(s.get("session_id")) in args.session_ids]
+        if args.max_sessions is not None:
+            sessions = sessions[: args.max_sessions]
+        if not sessions:
+            print("No recording sessions found in the database.")
+            return
+
+        # Setup the S3 client using provided AWS credentials or default env
+        if args.aws_access_key and args.aws_secret_key:
+            s3_client = boto3.client(
+                "s3", aws_access_key_id=args.aws_access_key, aws_secret_access_key=args.aws_secret_key
+            )
+        else:
+            s3_client = boto3.client("s3")
+
+        for session in tqdm(sessions, desc="Downloading sessions"):
+            tqdm.write(
+                f"Processing session {session.get('session_id')} | Title: {session.get('document_title')} | Lang: {session.get('document_language')} | Duration: {session.get('session_duration')} | User: {session.get('user_id')} | YOB: {session.get('year_of_birth')} | Sex: {session.get('biological_sex')}"
+            )
+            download_session_data_files(
+                s3_client, args.s3_bucket, args.s3_prefix, session.get("session_id"), output_dir, args.force_download
+            )
+            # Write session metadata to metadata.json in the session output directory (always regenerated)
+            session_output_dir = output_dir / session.get("session_id")
+            metadata_file = session_output_dir / "metadata.json"
+            session_id = str(session.get("session_id"))
+            session_metadata_instance = SessionMetadata(
+                source_type=source_type,
+                source_id=source_id,
+                source_entry_id=session_id,
+                session_id=session_id,
+                session_duration=float(session.get("session_duration")),
+                user_id=str(session.get("user_id")),
+                document_language=str(session.get("document_language")),
+                document_title=str(session.get("document_title")),
+                document_source_type=str(session.get("document_source_type")),
+                year_of_birth=int(session.get("year_of_birth")) if session.get("year_of_birth") is not None else None,
+                biological_sex=session.get("biological_sex"),
+                # Possibly determined later during alignment
+                quality_score=None,
+                per_segment_quality_scores=None,
+            )
+            with open(metadata_file, "w") as f:
+                f.write(session_metadata_instance.model_dump_json(indent=2))
 
     # After downloads complete, process normalization if not skipped
     if not args.skip_normalize:
@@ -229,10 +271,11 @@ def main() -> None:
             align_model=args.align_model,
             align_devices=args.align_devices,
             align_device_density=args.align_device_density,
-            force_reprocess=args.force_normalize_reprocess,
+            force_normalize_reprocess=args.force_normalize_reprocess,
             force_rescore=args.force_rescore,
             failure_threshold=args.failure_threshold,
             session_ids=args.session_ids,
+            max_sessions=args.max_sessions,
         )
 
     if not args.skip_manifest:
