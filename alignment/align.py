@@ -167,10 +167,10 @@ def align_transcript_to_audio(
                 current_pre_confusion_zone_tries += 1
                 continue
 
-        # Skiiping forward - to_align_next is all the text we tried to align in this attempt
+        # Skipping forward - to_align_next is all the text we tried to align in this attempt
         # of course we will skip some of it after deciding where to skip to
 
-        # Assume confusion start where the audio starts.
+        # Assume confusion starts where the audio starts.
         min_confusion_zone_start = slice_start
 
         # skip the confusion zone if no pre confusion zone retry
@@ -195,13 +195,13 @@ def align_transcript_to_audio(
 
         # problem is - we have the text of the unaligned but the segmentation
         # does not match the unaligned which we use to pickup the estimated skip point.
-        # this - we will use text matching to find the locations we are skipping over
+        # thus, we will use text matching to find the locations we are skipping over
         # and which segments (or parts of them) are left unaligned.
 
         # first get some prefix from the text to align next - this is what we could not align
         # after the last try ended.
-        # this usually cover the entire confusion zone up to the end
-        # of the entire text for the audio file
+        # this usually covers the entire confusion zone up to the end
+        # or the entire text for the audio file
         text_at_start_of_confusion_zone = to_align_next[: unaligned_start_text_match_search_radius // 3]
 
         search_tries_left = 3
@@ -243,7 +243,7 @@ def align_transcript_to_audio(
         # assume all content within the confusion zone span from the unaligned
         # is to be skipped (this may not contain all text in actual confusion zone. or may
         # contain text already aligned.
-        # This is a hail-mery attempt
+        # This is a hail-mary attempt
         if found_at_text_idx == -1:
             progress_bar.write(
                 f"Could not find matching text in {entry_id or 'entry'} confusion zone, slice_start: {slice_start} - hard skip (+corruption) expected"
@@ -337,9 +337,9 @@ def align_transcript_to_audio(
             # containing only the part which is skipped
             confusing_segments_to_skip = [initial_unaligned_segment_in_confusion_zone] + confusing_segments_to_skip
 
-            # Before comitting the skipped segments - we will align them to the audio slice they reside over
+            # Before committing the skipped segments - we will align them to the audio slice they reside over
             # this would not create high quality alignment probably - but will produce (arbitrary) word timings
-            # that allow those segmwnts to co-exist with the propelry aliged segments.
+            # that allow those segments to co-exist with the properly aligned segments.
             skipped_text_to_align = get_text_from_segments(confusing_segments_to_skip)
             align_skipped_start_from = max(top_aligned_timestamp, confusing_segments_to_skip[0].start)
             align_skipped_end_at = (

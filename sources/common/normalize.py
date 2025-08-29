@@ -305,7 +305,7 @@ class BaseNormalizer(ABC):
         quality_score: float,
         per_segment_scores: List[Dict[str, float]],
     ) -> None:
-        """Update plenum metadata with statistics from alignment result."""
+        """Update metadata with statistics from alignment result."""
         metadata.quality_score = quality_score
         metadata.per_segment_quality_scores = per_segment_scores
 
@@ -341,19 +341,15 @@ class BaseNormalizer(ABC):
             except ImportError:
                 device = "cpu"
 
-        
         device_index = 0
         if len(device.split(":")) == 2:
             device, device_index = device.split(":")
             device_index = int(device_index)
-        
+
         # Load the alignment model with int8 quantization for memory efficiency
         try:
             model = stable_whisper.load_faster_whisper(
-                self.align_model,
-                device=device,
-                device_index=device_index,
-                compute_type="int8"
+                self.align_model, device=device, device_index=device_index, compute_type="int8"
             )
             return model
         except Exception as e:
