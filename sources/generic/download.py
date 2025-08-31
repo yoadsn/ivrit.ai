@@ -36,7 +36,7 @@ def process_transcripts(
     """
     try:
         # Validate file extension - only support .txt files for now
-        if transcript_file.suffix.lower() != '.txt':
+        if transcript_file.suffix.lower() != ".txt":
             error_msg = f"Unsupported transcript file type: {transcript_file.suffix}. Only .txt files are supported."
             if abort_on_error:
                 raise ValueError(error_msg)
@@ -57,6 +57,7 @@ def process_transcripts(
 
         # Copy the transcript file to the output directory
         import shutil
+
         shutil.copy2(transcript_file, target_transcript)
         logging.info(f"Copied transcript from {transcript_file} to {target_transcript}")
 
@@ -107,7 +108,7 @@ def process_av(
                 return True, duration
 
         # Extract audio from the media file
-        output_audio_file = extract_audio_from_media(str(audio_file), str(target_audio_base))
+        output_audio_file = extract_audio_from_media(str(audio_file), str(target_audio_base), create_light_version=True)
         logging.info(f"Extracted audio from {audio_file} to {output_audio_file}")
 
         # Get audio information including duration
@@ -144,10 +145,14 @@ def main() -> None:
     )
     parser.add_argument("--input-structure-format", type=str, default="flat", help="Input directory structure format")
     parser.add_argument(
-        "--input-audio-file-globs", type=str, default="*.mp3", help="Glob pattern for audio files", nargs="+"
+        "--input-audio-file-globs", type=str, default=["*.mp3"], help="Glob pattern for audio files", nargs="+"
     )
     parser.add_argument(
-        "--input-transcript-file-globs", type=str, default="*.txt", help="Glob pattern for transcript files", nargs="+"
+        "--input-transcript-file-globs",
+        type=str,
+        default=["*.txt"],
+        help="Glob pattern for transcript files",
+        nargs="+",
     )
     parser.add_argument("--input-source-id", type=str, default="unknown", help="Source ID for the input dataset")
     parser.add_argument(
@@ -270,8 +275,12 @@ def main() -> None:
     logging.info(f"Found {len(input_audio_files)} audio files matching patterns: {args.input_audio_file_globs}")
 
     # Find all transcript files using the provided glob patterns
-    input_transcript_files = list(chain.from_iterable(input_dir.glob(patt) for patt in args.input_transcript_file_globs))
-    logging.info(f"Found {len(input_transcript_files)} transcript files matching patterns: {args.input_transcript_file_globs}")
+    input_transcript_files = list(
+        chain.from_iterable(input_dir.glob(patt) for patt in args.input_transcript_file_globs)
+    )
+    logging.info(
+        f"Found {len(input_transcript_files)} transcript files matching patterns: {args.input_transcript_file_globs}"
+    )
 
     # Create dictionaries mapping base names to file paths
     audio_files_by_basename = {}
@@ -316,12 +325,14 @@ def main() -> None:
     # Filter by entry IDs if specified
     if args.entry_ids:
         original_count = len(entries)
-        entries = [(audio, transcript, entry_id) for audio, transcript, entry_id in entries if entry_id in args.entry_ids]
+        entries = [
+            (audio, transcript, entry_id) for audio, transcript, entry_id in entries if entry_id in args.entry_ids
+        ]
         logging.info(f"Filtered by entry IDs {args.entry_ids}: {original_count} -> {len(entries)} entries")
 
     # Take first max_entries if specified
     if args.max_entries is not None and len(entries) > args.max_entries:
-        entries = entries[:args.max_entries]
+        entries = entries[: args.max_entries]
         logging.info(f"Limited to first {args.max_entries} entries")
 
     if not entries:  # entries is a list of tuples (audio_file, transcript_file, entry_id)
@@ -399,7 +410,9 @@ def main() -> None:
             align_model=args.align_model,
             align_devices=args.align_devices,
             align_device_density=args.align_device_density,
-            force_normalize_reprocess=args.force_reprocess or args.force_av_reprocess or args.force_transcript_reprocess,
+            force_normalize_reprocess=args.force_reprocess
+            or args.force_av_reprocess
+            or args.force_transcript_reprocess,
             force_rescore=args.force_rescore,
             failure_threshold=args.failure_threshold,
             entry_ids=args.entry_ids,
