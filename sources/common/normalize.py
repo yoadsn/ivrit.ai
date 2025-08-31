@@ -192,7 +192,9 @@ def normalize_entries(
             normalizer.load_model()
 
             # Process the entry
-            result = normalizer.normalize_entry(entry_dir=entry_dir, force_reprocess=force_reprocess, **kwargs)
+            result = normalizer.normalize_entry(
+                entry_dir=entry_dir, force_reprocess=force_reprocess, force_rescore=force_rescore, **kwargs
+            )
             return result
         finally:
             # Release the normalizer back to the queue
