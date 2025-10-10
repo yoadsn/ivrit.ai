@@ -274,13 +274,18 @@ def main() -> None:
     logging.info(f"Found {len(plenum_ids)} plenum IDs.")
 
     # Process each plenum
+    any_reprocess = (
+        args.force_reprocess
+        or args.force_av_reprocess
+        or args.force_transcript_reprocess
+        or args.force_normalize_reprocess
+    )
     for plenum_id in tqdm(plenum_ids, desc="Processing plenums", total=len(plenum_ids)):
         try:
             plenum_av_dir = input_media_dir / plenum_id
 
             # Check if this plenum has already been processed
             plenum_output_dir = output_dir / plenum_id
-            any_reprocess = args.force_reprocess or args.force_av_reprocess or args.force_transcript_reprocess
             if plenum_output_dir.exists() and not any_reprocess:
                 metadata_file = plenum_output_dir / "metadata.json"
                 if metadata_file.exists():

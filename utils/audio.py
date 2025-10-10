@@ -129,6 +129,27 @@ def transcode_to_mono_16k(input_file, output_file):
     run(cmd, stdout=DEVNULL, stderr=DEVNULL)
 
 
+def transcode_to_light_opus(input_file, output_file):
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        input_file,
+        "-c:a",
+        "libopus",
+        "-ar",
+        "24000",
+        "-ac",
+        "1",
+        "-b:a",
+        "32k",
+        "-vbr",
+        "off",
+        output_file,
+    ]
+    run(cmd, stdout=DEVNULL, stderr=DEVNULL)
+
+
 # Map of known container to audio-only equivalents
 AUDIO_ONLY_CONTAINERS = {
     "mp4": "m4a",
@@ -173,7 +194,7 @@ def get_audio_only_extension(audio_info: Optional[AudioInfo]) -> str:
         return "mp3"  # Safe default
 
 
-def extract_audio_from_media(input_file: str, output_audio_base_file: str) -> str:
+def extract_audio_from_media(input_file: str, output_audio_base_file: str, create_light_version: bool = False) -> str:
     """
     Extract audio from media file, automatically determining the best output format.
 
@@ -204,5 +225,9 @@ def extract_audio_from_media(input_file: str, output_audio_base_file: str) -> st
 
     # Run the command
     run(cmd, stdout=DEVNULL, stderr=DEVNULL)
+
+    if create_light_version:
+        light_audio_file = f"{output_audio_base_file}.light.opus"
+        transcode_to_light_opus(input_file, light_audio_file)
 
     return output_audio_file
