@@ -4,6 +4,7 @@ from sources.common.manifest import build_manifest as common_build_manifest, COM
 # Source-specific columns for generic
 GENERIC_COLUMNS = [
     "duration",
+    "user_id",
 ]
 
 

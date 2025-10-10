@@ -1,10 +1,11 @@
 from itertools import chain
 import argparse
+import json
 import logging
 import pathlib
 import re
 from logging.handlers import RotatingFileHandler
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from tqdm import tqdm
 
@@ -128,6 +129,23 @@ def process_av(
         return False, None
 
 
+def extract_metadata_fields(metadata_file: pathlib.Path, field_specs_to_extract: List[str]) -> Dict[str, Any]:
+    # split fields to source,target pairs
+    src_target_fields = [field.split(":") for field in field_specs_to_extract]
+
+    # only supported targests are accepted
+    supported_target_md_fields = ["user_id"]
+    src_target_fields = [field for field in src_target_fields if field[1] in supported_target_md_fields]
+
+    if not src_target_fields:
+        return {}
+
+    with open(metadata_file, "r") as f:
+        metadata = json.load(f)
+        target_md_fields = {field[1]: metadata.get(field[0], None) for field in src_target_fields}
+        return target_md_fields
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Download and process generic audio/transcript datasets.")
     parser.add_argument(
@@ -154,6 +172,20 @@ def main() -> None:
         help="Glob pattern for transcript files",
         nargs="+",
     )
+    parser.add_argument(
+        "--input-metadata-file-globs",
+        type=str,
+        default=["*.json"],
+        help="Glob pattern for metadata files",
+        nargs="+",
+    )
+    parser.add_argument(
+        "--extract-md-fields",
+        type=str,
+        nargs="+",
+        default=[],
+        help="Fields to extract from metadata files. Format is <source_md_field_name>:<target_md_field_name>. Can be specified multiple times. Support only 'user_id' target md field",
+    )
     parser.add_argument("--input-source-id", type=str, default="unknown", help="Source ID for the input dataset")
     parser.add_argument(
         "--output-dir",
@@ -175,6 +207,11 @@ def main() -> None:
         "--force-transcript-reprocess",
         action="store_true",
         help="Force re-process of transcripts even if it exist.",
+    )
+    parser.add_argument(
+        "--force-generate-metadata",
+        action="store_true",
+        help="Force re-generate of metadata even if it exist.",
     )
     parser.add_argument(
         "--abort-on-error",
@@ -267,8 +304,9 @@ def main() -> None:
 
     # Currently the only supported structure is flat
     # This structure is a single folder, containing two files per entry - audio and transcript
+    # optionally, also include a metadata file with a json suffix and format.
     # the files name is the same and is the entry ID, the extension mark the type of file.
-    # we use follow the provided glob patterns to find the files.
+    # we use above glob patterns to find the files.
 
     # Find all audio files using the provided glob patterns
     input_audio_files = list(chain.from_iterable(input_dir.glob(patt) for patt in args.input_audio_file_globs))
@@ -282,6 +320,16 @@ def main() -> None:
         f"Found {len(input_transcript_files)} transcript files matching patterns: {args.input_transcript_file_globs}"
     )
 
+    # Find all metadata files using the provided glob patterns
+    input_metadata_files = []
+    if args.input_metadata_file_globs is not None:
+        input_metadata_files = list(
+            chain.from_iterable(input_dir.glob(patt) for patt in args.input_metadata_file_globs)
+        )
+        logging.info(
+            f"Found {len(input_metadata_files)} metadata files matching patterns: {args.input_metadata_file_globs}"
+        )
+
     # Create dictionaries mapping base names to file paths
     audio_files_by_basename = {}
     for audio_file in input_audio_files:
@@ -293,12 +341,18 @@ def main() -> None:
         basename = transcript_file.stem  # Get filename without extension
         transcript_files_by_basename[basename] = transcript_file
 
+    metadata_files_by_basename = {}
+    for metadata_file in input_metadata_files:
+        basename = metadata_file.stem  # Get filename without extension
+        metadata_files_by_basename[basename] = metadata_file
+
     # Match audio and transcript files by base name
     all_basenames = set(audio_files_by_basename.keys()) | set(transcript_files_by_basename.keys())
 
     for basename in all_basenames:
         audio_file = audio_files_by_basename.get(basename)
         transcript_file = transcript_files_by_basename.get(basename)
+        maybe_metadata_file = metadata_files_by_basename.get(basename, None)
 
         # Check for missing files
         if audio_file is None:
@@ -318,15 +372,17 @@ def main() -> None:
                 raise FileNotFoundError(f"{msg}. Use --ignore-missing-files to skip missing entries.")
 
         # Add matched pair to entries list
-        entries.append((audio_file, transcript_file, basename))
+        entries.append((audio_file, transcript_file, maybe_metadata_file, basename))
 
-    logging.info(f"Successfully matched {len(entries)} audio-transcript pairs")
+    logging.info(f"Successfully matched {len(entries)} audio-transcript-metadata? pairs")
 
     # Filter by entry IDs if specified
     if args.entry_ids:
         original_count = len(entries)
         entries = [
-            (audio, transcript, entry_id) for audio, transcript, entry_id in entries if entry_id in args.entry_ids
+            (audio, transcript, md, entry_id)
+            for audio, transcript, md, entry_id in entries
+            if entry_id in args.entry_ids
         ]
         logging.info(f"Filtered by entry IDs {args.entry_ids}: {original_count} -> {len(entries)} entries")
 
@@ -342,11 +398,19 @@ def main() -> None:
     logging.info(f"Found {len(entries)} entry IDs.")
 
     # Process each entry
-    for audio_file, transcript_file, entry_id in tqdm(entries, desc="Processing entries", total=len(entries)):
+    any_reprocess = (
+        args.force_reprocess
+        or args.force_av_reprocess
+        or args.force_transcript_reprocess
+        or args.force_normalize_reprocess
+        or args.force_generate_metadata
+    )
+    for audio_file, transcript_file, maybe_metadata_file, entry_id in tqdm(
+        entries, desc="Processing entries", total=len(entries)
+    ):
         try:
             # Check if this entry has already been processed
             entry_output_dir = output_dir / entry_id
-            any_reprocess = args.force_reprocess or args.force_av_reprocess or args.force_transcript_reprocess
             if entry_output_dir.exists() and not any_reprocess:
                 metadata_file = entry_output_dir / "metadata.json"
                 if metadata_file.exists():
@@ -379,6 +443,11 @@ def main() -> None:
                 logging.warning(msg)
                 continue
 
+            extracted_md = {}
+            if maybe_metadata_file and args.extract_md_fields:
+                tqdm.write(" - Extracting metadata fields...")
+                extracted_md = extract_metadata_fields(maybe_metadata_file, args.extract_md_fields)
+
             # Create metadata
             entry_metadata = GenericMetadata(
                 source_type=source_type,
@@ -386,6 +455,7 @@ def main() -> None:
                 source_entry_id=entry_id,
                 language=args.language,
                 duration=round(duration or 0.0, 2),
+                **extracted_md,
             )
 
             # Save metadata
@@ -410,10 +480,13 @@ def main() -> None:
             align_model=args.align_model,
             align_devices=args.align_devices,
             align_device_density=args.align_device_density,
+            # any force processing upstream or directly force normalize?
             force_normalize_reprocess=args.force_reprocess
             or args.force_av_reprocess
-            or args.force_transcript_reprocess,
-            force_rescore=args.force_rescore,
+            or args.force_transcript_reprocess
+            or args.force_normalize_reprocess,
+            # Any reason to write out scores to md or forced rescore?
+            force_rescore=args.force_rescore or args.force_generate_metadata,
             failure_threshold=args.failure_threshold,
             entry_ids=args.entry_ids,
             abort_on_error=args.abort_on_error,

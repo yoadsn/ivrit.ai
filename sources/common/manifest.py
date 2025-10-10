@@ -8,7 +8,7 @@ import pandas as pd
 def build_manifest(input_folder: str, columns: List[str]) -> None:
     """
     Build a manifest CSV file from metadata.json files in the input folder.
-    
+
     Args:
         input_folder: Path to the folder containing metadata.json files
         columns: List of columns to include in the manifest
@@ -52,6 +52,7 @@ COMMON_COLUMNS = [
     "source_type",
     "source_id",
     "source_entry_id",
+    "language",
     "quality_score",
     "min_segment_quality_score",
     "avg_words_per_segment",
