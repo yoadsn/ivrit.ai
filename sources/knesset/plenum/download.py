@@ -7,10 +7,10 @@ from typing import List, Optional, Tuple
 
 from tqdm import tqdm
 
-from sources.knesset.extraction import process_transcripts
-from sources.knesset.manifest import build_manifest
-from sources.knesset.metadata import PlenumMetadata, plenum_source_id, source_type
-from sources.knesset.normalize import add_normalize_args, normalize_plenums
+from sources.knesset.plenum.extraction import process_transcripts
+from sources.knesset.plenum.manifest import build_manifest
+from sources.knesset.plenum.metadata import PlenumMetadata, plenum_source_id, source_type
+from sources.knesset.plenum.normalize import add_normalize_args, normalize_plenums
 from utils.audio import extract_audio_from_media, get_audio_info
 
 

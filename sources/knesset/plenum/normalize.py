@@ -17,7 +17,7 @@ from sources.common.normalize import (
 )
 from sources.common.normalize import add_common_normalize_args as add_normalize_args
 from sources.common.normalize import normalize_entries
-from sources.knesset.metadata import PlenumMetadata
+from sources.knesset.plenum.metadata import PlenumMetadata
 
 
 # Create a logger for this module

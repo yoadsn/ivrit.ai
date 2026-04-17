@@ -11,7 +11,7 @@ import pandas as pd
 from bs4 import BeautifulSoup, NavigableString, PageElement
 from stable_whisper import WhisperResult
 
-from sources.knesset.cleanup import cleanup_time_index
+from sources.knesset.plenum.cleanup import cleanup_time_index
 
 # Create a logger for this module
 logger = logging.getLogger(__name__)
