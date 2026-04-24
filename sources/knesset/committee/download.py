@@ -1,0 +1,361 @@
+import argparse
+import csv
+import logging
+import pathlib
+from logging.handlers import RotatingFileHandler
+
+from tqdm import tqdm
+
+from sources.knesset.committee.create_maps import add_create_maps_args, create_maps_sessions
+from sources.knesset.committee.extraction import is_extracted, process_protocol
+from sources.knesset.committee.metadata import (
+    CommitteeMetadata,
+    committee_source_id,
+    source_type,
+)
+from sources.knesset.committee.normalize import add_normalize_args, normalize_sessions
+from sources.knesset.committee.pre_align import add_prealign_args, pre_align_sessions
+from sources.knesset.committee.s3 import make_s3_client, s3_download, s3_uri_filename
+from utils.audio import get_audio_info
+
+
+def _download_to(
+    s3_client,
+    s3_uri: str,
+    dest: pathlib.Path,
+    force: bool = False,
+) -> pathlib.Path:
+    """Download an S3 object to ``dest`` unless already present."""
+    if dest.exists() and not force:
+        logging.info("Already downloaded: %s", dest)
+        return dest
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    s3_download(s3_client, s3_uri, dest)
+    return dest
+
+
+def ensure_protocol_downloaded(
+    s3_client,
+    s3_uri: str,
+    session_dir: pathlib.Path,
+    force: bool = False,
+) -> pathlib.Path:
+    session_dir.mkdir(parents=True, exist_ok=True)
+    dest = session_dir / s3_uri_filename(s3_uri)
+    return _download_to(s3_client, s3_uri, dest, force=force)
+
+
+def ensure_audio_downloaded(
+    s3_client,
+    s3_uri: str,
+    session_dir: pathlib.Path,
+    force: bool = False,
+) -> pathlib.Path:
+    """Download the audio as ``audio.<ext>`` to align with other sources."""
+    session_dir.mkdir(parents=True, exist_ok=True)
+    ext = pathlib.Path(s3_uri_filename(s3_uri)).suffix or ".bin"
+    dest = session_dir / f"audio{ext}"
+
+    existing = next(session_dir.glob("audio.*"), None)
+    if existing and not force:
+        logging.info("Audio already present: %s", existing)
+        return existing
+
+    # force=True: clear out any older audio with a different extension.
+    if force:
+        for prev in session_dir.glob("audio.*"):
+            if prev != dest:
+                prev.unlink()
+
+    return _download_to(s3_client, s3_uri, dest, force=force)
+
+
+def get_audio_duration(session_dir: pathlib.Path) -> float | None:
+    """Return the duration (seconds) of the audio file in ``session_dir``, or None."""
+    audio_file = next(session_dir.glob("audio.*"), None)
+    if audio_file is None:
+        return None
+    info = get_audio_info(str(audio_file))
+    return info.duration if info is not None else None
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Download and extract Knesset committee session data."
+    )
+    parser.add_argument(
+        "--input-manifest-file",
+        type=str,
+        required=True,
+        help=(
+            "Path to the input manifest CSV with columns: "
+            "session_id, start_date, audio_file_path, protocol_file_path."
+        ),
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        required=True,
+        help="Output directory where session folders will be written.",
+    )
+    parser.add_argument(
+        "--force-download",
+        action="store_true",
+        help="Force re-download of audio and protocol even if they exist locally.",
+    )
+    parser.add_argument(
+        "--force-extract",
+        action="store_true",
+        help="Force re-extraction of protocol artifacts even if outputs exist.",
+    )
+    parser.add_argument(
+        "--force-pre-align",
+        action="store_true",
+        help="Force re-run of the pre-align stage (transcribe + time accurate text) even if outputs exist.",
+    )
+    parser.add_argument(
+        "--abort-on-error",
+        action="store_true",
+        help="Abort the run on the first processing error instead of skipping.",
+    )
+    parser.add_argument(
+        "--session-ids",
+        type=str,
+        nargs="+",
+        default=[],
+        help="Process only the specified session ids.",
+    )
+    parser.add_argument(
+        "--max-sessions",
+        type=int,
+        default=None,
+        help="Maximum number of sessions to process in this run.",
+    )
+    parser.add_argument(
+        "--skip-audio",
+        action="store_true",
+        help="Skip audio download (useful when only the protocol text is needed).",
+    )
+    parser.add_argument(
+        "--logs-folder",
+        type=str,
+        help="Folder to store log files. If not specified, logging is disabled.",
+    )
+
+    # AWS credential overrides.  When omitted, boto3 falls back to the
+    # standard credential chain (env vars, ~/.aws/credentials, IAM role).
+    parser.add_argument(
+        "--aws-access-key-id",
+        type=str,
+        default=None,
+        help="AWS access key ID (falls back to env / credentials file).",
+    )
+    parser.add_argument(
+        "--aws-secret-access-key",
+        type=str,
+        default=None,
+        help="AWS secret access key (falls back to env / credentials file).",
+    )
+    parser.add_argument(
+        "--aws-region",
+        type=str,
+        default=None,
+        help="AWS region (falls back to env / config).",
+    )
+
+    # Pre-align, normalization, and create-maps tunables.
+    add_prealign_args(parser)
+    add_normalize_args(parser)
+    add_create_maps_args(parser)
+    parser.add_argument(
+        "--skip-normalize",
+        action="store_true",
+        help="Skip the normalize (alignment + quality scoring) stage.",
+    )
+
+    args = parser.parse_args()
+
+    input_manifest_file = pathlib.Path(args.input_manifest_file)
+    if not input_manifest_file.exists() or not input_manifest_file.is_file():
+        print(f"Input manifest file '{input_manifest_file}' does not exist or is not a file.")
+        return
+
+    output_dir = pathlib.Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Configure logging.
+    logging.basicConfig(level=logging.CRITICAL + 1)
+    if args.logs_folder:
+        logs_folder = pathlib.Path(args.logs_folder)
+        logs_folder.mkdir(parents=True, exist_ok=True)
+        root_logger = logging.getLogger()
+        root_logger.setLevel(logging.INFO)
+        for handler in root_logger.handlers[:]:
+            root_logger.removeHandler(handler)
+        file_handler = RotatingFileHandler(
+            logs_folder / "download_log", maxBytes=5 * 1024 * 1024, backupCount=5
+        )
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(
+            logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+        )
+        root_logger.addHandler(file_handler)
+        logging.info("Starting Knesset committee download into %s", output_dir)
+
+    # Parse the manifest.
+    expected_columns = {"session_id", "start_date", "audio_file_path", "protocol_file_path"}
+    with open(input_manifest_file, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        header = set(reader.fieldnames or [])
+        if not expected_columns.issubset(header):
+            print(
+                f"Input manifest file '{input_manifest_file}' is missing required columns. "
+                f"Expected: {sorted(expected_columns)}. Found: {sorted(header)}"
+            )
+            return
+        manifest_entries = [row for row in reader]
+
+    if args.session_ids:
+        wanted = set(args.session_ids)
+        manifest_entries = [e for e in manifest_entries if e["session_id"] in wanted]
+
+    if args.max_sessions is not None:
+        manifest_entries = manifest_entries[: args.max_sessions]
+
+    if not manifest_entries:
+        logging.info("No manifest entries to process.")
+        return
+
+    logging.info("Processing %d sessions.", len(manifest_entries))
+
+    s3 = make_s3_client(
+        aws_access_key_id=args.aws_access_key_id,
+        aws_secret_access_key=args.aws_secret_access_key,
+        aws_region=args.aws_region,
+    )
+
+    ready_session_dirs: list[pathlib.Path] = []
+
+    for entry in tqdm(manifest_entries, desc="Processing sessions"):
+        session_id = entry["session_id"]
+        session_output_dir = output_dir / session_id
+
+        try:
+            session_output_dir.mkdir(parents=True, exist_ok=True)
+
+            # --- 1. Download protocol archive ---
+            tqdm.write(f" - Downloading protocol for session {session_id}...")
+            protocol_path = ensure_protocol_downloaded(
+                s3,
+                entry["protocol_file_path"],
+                session_output_dir,
+                force=args.force_download,
+            )
+
+            # --- 2. Download audio (optional) ---
+            if not args.skip_audio:
+                tqdm.write(f" - Downloading audio for session {session_id}...")
+                ensure_audio_downloaded(
+                    s3,
+                    entry["audio_file_path"],
+                    session_output_dir,
+                    force=args.force_download,
+                )
+
+            # --- 3. Extract protocol artifacts ---
+            tqdm.write(f" - Extracting protocol for session {session_id}...")
+            extract_ok = process_protocol(
+                protocol_path,
+                session_output_dir,
+                force_reprocess=args.force_extract,
+            )
+            if not extract_ok:
+                msg = f" - ERROR: extraction failed for session {session_id}."
+                tqdm.write(msg)
+                logging.warning(msg)
+                if args.abort_on_error:
+                    raise RuntimeError(msg)
+                continue
+
+            if not is_extracted(session_output_dir):
+                # Defensive: extraction reported success but output is missing.
+                msg = f" - ERROR: extracted outputs missing for session {session_id}."
+                tqdm.write(msg)
+                logging.warning(msg)
+                if args.abort_on_error:
+                    raise RuntimeError(msg)
+                continue
+
+            # --- 4. Write session metadata ---
+            duration = get_audio_duration(session_output_dir) if not args.skip_audio else None
+            session_metadata = CommitteeMetadata(
+                source_type=source_type,
+                source_id=committee_source_id,
+                source_entry_id=session_id,
+                session_id=session_id,
+                session_date=entry.get("start_date") or None,
+                language="he",
+                duration=duration,
+            )
+            metadata_file = session_output_dir / "metadata.json"
+            with open(metadata_file, "w", encoding="utf-8") as f:
+                f.write(session_metadata.model_dump_json(indent=2))
+
+            ready_session_dirs.append(session_output_dir)
+            tqdm.write(f" - Successfully processed session {session_id}")
+        except Exception as e:
+            msg = f" - ERROR: Unexpected error processing session {session_id}: {e}"
+            tqdm.write(msg)
+            logging.warning(msg)
+            if args.abort_on_error:
+                raise
+            tqdm.write(" - Skipping to next session")
+
+    # --- Pre-align stage (batch, one worker per device) ---
+    if ready_session_dirs and not args.skip_pre_align and not args.skip_audio:
+        print(f"Pre-aligning {len(ready_session_dirs)} session(s)...")
+        pre_align_sessions(
+            ready_session_dirs,
+            devices=args.pre_align_devices,
+            model_name=args.pre_align_model_name,
+            compute_type=args.pre_align_compute_type,
+            language="he",
+            force=args.force_pre_align,
+            abort_on_error=args.abort_on_error,
+        )
+
+    # --- Normalize stage (alignment + quality scoring) ---
+    if not args.skip_normalize:
+        print("Starting normalization process...")
+        normalize_sessions(
+            output_dir,
+            align_model=args.align_model,
+            align_devices=args.align_devices or [],
+            align_device_density=args.align_device_density,
+            force_normalize_reprocess=args.force_normalize_reprocess
+            or args.force_pre_align,
+            force_rescore=args.force_rescore,
+            failure_threshold=args.failure_threshold,
+            plenum_ids=args.session_ids,
+            abort_on_error=args.abort_on_error,
+        )
+
+    # --- Create maps stage (char offsets + speaker IDs for aligned segments) ---
+    if not args.skip_create_maps:
+        print("Creating aligned transcript maps...")
+        create_maps_sessions(
+            output_dir,
+            force=args.force_create_maps or args.force_normalize_reprocess or args.force_pre_align,
+            session_ids=args.session_ids,
+            abort_on_error=args.abort_on_error,
+        )
+
+
+if __name__ == "__main__":
+    import sys
+
+    print(
+        "This module is not intended to be executed directly. "
+        "Please use the top-level download.py.",
+        file=sys.stderr,
+    )

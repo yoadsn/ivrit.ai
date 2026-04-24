@@ -1,3 +1,51 @@
+[project]
+name = "ivrit-ai-data-pipeline"
+version = "0.1.0"
+requires-python = "==3.12.*"
+dependencies = [
+    "backoff",
+    "boto3==1.36.21",
+    "datasets",
+    "faster-whisper<1.1.0",
+    "flask",
+    "Flask-OAuthlib",
+    "librosa",
+    "mutagen",
+    "hebrew",
+    "numpy<2",
+    "openai-whisper",
+    "pydub",
+    "sortedcontainers",
+    "soundfile",
+    "torch",
+    "torchaudio",
+    "transformers",
+    "feedparser",
+    "openai",
+    "python-dotenv",
+    "psycopg[binary]==3.2.4",
+    "jiwer",
+    "pandas",
+    "yt_dlp",
+    "beautifulsoup4",
+    "webvtt-py",
+    "scipy",
+    "tqdm",
+    "pydantic",
+    "pyodata",
+    "python-docx",
+    "nemo_toolkit[asr]",
+    "stable-ts==2.18.3",
+]
+
+[project.optional-dependencies]
+sources-preview = [
+    "fastapi[standard]",
+]
+
+[tool.uv]
+no-build-isolation-package = ["openai-whisper"]
+
 [tool.black]
 line-length = 120
 
