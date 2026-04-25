@@ -224,14 +224,17 @@ def get_transcript(session_id: str):
         # Include word-level timing when available
         raw_words = seg.get("words")
         if raw_words:
-            entry["words"] = [
-                {
+            words_out = []
+            for w in raw_words:
+                wd = {
                     "word": w["word"],
                     "start": float(w["start"]),
                     "end": float(w["end"]),
                 }
-                for w in raw_words
-            ]
+                if "probability" in w:
+                    wd["probability"] = float(w["probability"])
+                words_out.append(wd)
+            entry["words"] = words_out
         # Attach speaker info from map if available
         if segment_maps is not None and i < len(segment_maps):
             m = segment_maps[i]
@@ -402,6 +405,7 @@ _INDEX_HTML = """\
   .segment .text .word {
     cursor: pointer;
     border-radius: 2px;
+    border-bottom: 2px solid transparent;
   }
   .segment .text .word:hover {
     background: var(--primary-light);
@@ -612,6 +616,9 @@ function createSegmentEl(i) {
       span.className = 'word';
       span.textContent = w.word;
       span.dataset.wi = wi;
+      if (w.probability != null) {
+        span.style.borderBottomColor = probColor(w.probability);
+      }
       if (i === activeSegIdx && wi === activeWordIdx) {
         span.classList.add('word-active');
       }
@@ -634,6 +641,14 @@ function createSegmentEl(i) {
   });
 
   return el;
+}
+
+function probColor(p) {
+  // Interpolate from #FD1D1D (0) to #3CB43A (1)
+  const r = Math.round(0xFD + (0x3C - 0xFD) * p);
+  const g = Math.round(0x1D + (0xB4 - 0x1D) * p);
+  const b = Math.round(0x1D + (0x3A - 0x1D) * p);
+  return `rgb(${r},${g},${b})`;
 }
 
 function fmtTime(s) {
