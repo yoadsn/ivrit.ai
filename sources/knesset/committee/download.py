@@ -15,8 +15,13 @@ from sources.knesset.committee.metadata import (
     source_type,
 )
 from sources.knesset.committee.normalize import add_normalize_args, normalize_sessions
-from sources.knesset.committee.pre_align import add_prealign_args, pre_align_sessions
 from sources.knesset.committee.refine_segments import add_refine_segments_args, refine_segments_sessions
+from sources.common.pre_align import (
+    add_prealign_args,
+    pre_align_sessions as _common_pre_align_sessions,
+)
+
+RAW_PROTOCOL_FILENAME = "raw.protocol.txt"
 from sources.knesset.committee.vad import add_vad_args, vad_sessions
 from sources.knesset.committee.s3 import make_s3_client, s3_download, s3_uri_filename
 from utils.audio import get_audio_info
@@ -80,6 +85,18 @@ def get_audio_duration(session_dir: pathlib.Path) -> float | None:
         return None
     info = get_audio_info(str(audio_file))
     return info.duration if info is not None else None
+
+
+def _committee_accurate_text_resolver(session_dir: pathlib.Path) -> pathlib.Path:
+    return session_dir / RAW_PROTOCOL_FILENAME
+
+
+def pre_align_sessions(session_dirs, **kwargs):
+    return _common_pre_align_sessions(
+        session_dirs=session_dirs,
+        accurate_text_resolver=_committee_accurate_text_resolver,
+        **kwargs,
+    )
 
 
 def main() -> None:

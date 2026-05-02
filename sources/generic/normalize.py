@@ -4,6 +4,7 @@ import pathlib
 import time
 from typing import List, Optional
 
+import stable_whisper
 import torch
 
 from stable_whisper.result import WhisperResult
@@ -41,18 +42,24 @@ class GenericNormalizer(BaseNormalizer):
 
     def get_input_transcript_file(self, entry_dir: pathlib.Path) -> pathlib.Path:
         # Find the transcript file in the entry folder.
-        # It starts with "transcript" and the extension can be anything
-        transcript_files = list(entry_dir.glob("transcript*"))
-        # ignore any transcript files that are "aligned"
-        aligned_transcript_files = [f for f in transcript_files if "aligned" not in f.name]
+        # It starts with "transcript" and the extension can be anything.
+        # Prefer transcript.json (produced by pre-align with timing info)
+        # over transcript.txt (plain text without timing).
+        transcript_json = entry_dir / "transcript.json"
+        if transcript_json.exists():
+            return transcript_json
 
-        transcript_file = aligned_transcript_files[0] if aligned_transcript_files else None
+        transcript_files = list(entry_dir.glob("transcript*"))
+        # ignore any transcript files that are "aligned" or "prealign"
+        candidates = [f for f in transcript_files if "aligned" not in f.name and "prealign" not in f.name]
+
+        transcript_file = candidates[0] if candidates else None
         if not transcript_file:
             raise FileNotFoundError(f"No transcript file found in {entry_dir}")
         return transcript_file
 
     def read_transcript_file_as_whisper_result(self, transcript_file: pathlib.Path):
-        raise NotImplementedError("read_transcript_file_as_whisper_result is not implemented for this normalizer")
+        return stable_whisper.WhisperResult(str(transcript_file))
 
     def read_transcript_text_as_whisper_result(self, transcript_file: pathlib.Path, duration: float):
         assert transcript_file.suffix.lower() == ".txt"

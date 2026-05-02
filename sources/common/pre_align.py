@@ -1,33 +1,25 @@
-"""Pre-alignment stage for Knesset committee sessions.
+"""Common pre-alignment logic shared across sources.
 
-For each session output directory, runs two sub-stages:
+For each session/entry output directory, runs two sub-stages:
 
-  1. **Transcribe** the session audio with ``stable_whisper``
+  1. **Transcribe** the audio with ``stable_whisper``
      (faster-whisper backend).  The resulting ``WhisperResult`` is saved as
-     ``<session_id>.trans.json`` — native stable-ts schema, times in
+     ``prealign.transcript.json`` -- native stable-ts schema, times in
      seconds.
   2. **Time the accurate text** by aligning it against the inaccurate
      transcription using a Text Fingerprint Vector (TFV) cosine-similarity
      sweep.  Produces:
-        * ``transcript.json`` — a canonical WhisperResult dump; segments
+        * ``transcript.json`` -- a canonical WhisperResult dump; segments
           carry only standard ``start / end / text`` fields.
 
 All timestamps are in **seconds** (matching stable-ts native output).
 
-The alignment math is adapted from the reference implementation in
-``knesset_committee_data/time_session_text.py``; the differences are:
-
-  * input is stable-ts JSON (``segments[*].{start,end,words}``) instead of
-    whisper.cpp offsets (ms + sub-word tokens);
-  * all times are seconds, not milliseconds;
-  * word-level timestamps drive the per-char time map (whisper.cpp tokens
-    are not available from stable-ts / faster-whisper).
-
 Public entry points:
 
-* :func:`add_prealign_args` — adds CLI flags to an ``argparse`` parser.
-* :func:`pre_align_sessions` — batch orchestrator that spawns one worker
+* :func:`add_prealign_args` -- adds CLI flags to an ``argparse`` parser.
+* :func:`pre_align_sessions` -- batch orchestrator that spawns one worker
   process per device and drains a shared queue.
+* Individual helpers for transcription, alignment, and segmentation.
 """
 
 from __future__ import annotations
@@ -56,6 +48,7 @@ DEFAULT_COMPUTE_TYPE = "int8"
 
 
 def add_prealign_args(parser: argparse.ArgumentParser) -> None:
+    """Add common pre-align CLI flags to *parser*."""
     parser.add_argument(
         "--pre-align-devices",
         type=str,
@@ -85,20 +78,20 @@ def add_prealign_args(parser: argparse.ArgumentParser) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Hebrew TFV — ported from knesset_committee_data/time_session_text.py
+# Hebrew TFV -- ported from knesset_committee_data/time_session_text.py
 # ---------------------------------------------------------------------------
 
-_BASE_LETTERS = "אבגדהוזחטיכלמנסעפצקרשת"
-_FINAL_TO_BASE = {"ך": "כ", "ם": "מ", "ן": "נ", "ף": "פ", "ץ": "צ"}
+_BASE_LETTERS = "\u05d0\u05d1\u05d2\u05d3\u05d4\u05d5\u05d6\u05d7\u05d8\u05d9\u05db\u05dc\u05de\u05e0\u05e1\u05e2\u05e4\u05e6\u05e7\u05e8\u05e9\u05ea"
+_FINAL_TO_BASE = {"\u05da": "\u05db", "\u05dd": "\u05de", "\u05df": "\u05e0", "\u05e3": "\u05e4", "\u05e5": "\u05e6"}
 _DIGITS = "0123456789"
 _PRIVATE_BINS = list(_BASE_LETTERS) + list(_DIGITS)
 _HOMOPHONE_GROUPS: list[tuple[str, ...]] = [
-    ("א", "ע"),
-    ("ב", "ו"),
-    ("ט", "ת"),
-    ("כ", "ח"),
-    ("כ", "ק"),
-    ("ס", "ש"),
+    ("\u05d0", "\u05e2"),
+    ("\u05d1", "\u05d5"),
+    ("\u05d8", "\u05ea"),
+    ("\u05db", "\u05d7"),
+    ("\u05db", "\u05e7"),
+    ("\u05e1", "\u05e9"),
 ]
 _GROUP_BIN_LABELS = ["+".join(g) for g in _HOMOPHONE_GROUPS]
 _ALL_BIN_LABELS = _PRIVATE_BINS + _GROUP_BIN_LABELS
@@ -170,7 +163,7 @@ def load_inaccurate_text_from_stable_ts(trans_json_path: Path) -> InaccurateText
 
     Uses word-level timestamps when available; falls back to segment-level
     linear interpolation otherwise.  Stable-ts word entries normally
-    include a leading space as part of ``word`` — we preserve it so the
+    include a leading space as part of ``word`` -- we preserve it so the
     concatenated string matches spoken spacing.
     """
     data = json.loads(trans_json_path.read_text(encoding="utf-8"))
@@ -523,11 +516,9 @@ def segment_text(
 
 
 # ---------------------------------------------------------------------------
-# Per-session orchestration
+# Per-session/entry orchestration
 # ---------------------------------------------------------------------------
 
-
-RAW_PROTOCOL_FILENAME = "raw.protocol.txt"
 PREALIGN_TRANSCRIPT_FILENAME = "prealign.transcript.json"
 TRANSCRIPT_FILENAME = "transcript.json"
 
@@ -536,7 +527,8 @@ def is_pre_aligned(session_dir: Path) -> bool:
     return (session_dir / TRANSCRIPT_FILENAME).exists()
 
 
-def _find_audio(session_dir: Path) -> Path:
+def find_audio(session_dir: Path) -> Path:
+    """Locate the ``audio.*`` file inside *session_dir*."""
     audio_file = next(session_dir.glob("audio.*"), None)
     if audio_file is None:
         raise FileNotFoundError(f"No audio.* file found in {session_dir}")
@@ -547,7 +539,7 @@ def transcribe_session(session_dir: Path, model, language: str) -> Path:
     """Transcribe the session audio via stable_ts and save the raw
     ``WhisperResult`` to ``prealign.transcript.json``."""
     out_path = session_dir / PREALIGN_TRANSCRIPT_FILENAME
-    audio_path = _find_audio(session_dir)
+    audio_path = find_audio(session_dir)
     result = model.transcribe_stable(
         str(audio_path),
         language=language,
@@ -557,20 +549,29 @@ def transcribe_session(session_dir: Path, model, language: str) -> Path:
     return out_path
 
 
-def prealign_session(session_dir: Path, language: str = "he") -> None:
-    """Time the accurate protocol text and write ``transcript.json``.
+def prealign_session(
+    session_dir: Path,
+    accurate_text_path: Path,
+    language: str = "he",
+) -> None:
+    """Time the accurate text and write ``transcript.json``.
 
-    ``transcript.json`` is a canonical WhisperResult dump (standard fields
-    only: ``start`` / ``end`` / ``text`` per segment).
+    Parameters
+    ----------
+    session_dir:
+        Directory containing ``prealign.transcript.json`` and audio.
+    accurate_text_path:
+        Path to the plain-text file with the accurate transcript.
+    language:
+        Language code for the output WhisperResult.
     """
-    accurate_path = session_dir / RAW_PROTOCOL_FILENAME
     trans_path = session_dir / PREALIGN_TRANSCRIPT_FILENAME
-    if not accurate_path.exists():
-        raise FileNotFoundError(f"Accurate text not found: {accurate_path}")
+    if not accurate_text_path.exists():
+        raise FileNotFoundError(f"Accurate text not found: {accurate_text_path}")
     if not trans_path.exists():
         raise FileNotFoundError(f"Pre-align transcription not found: {trans_path}")
 
-    accurate_text = accurate_path.read_text(encoding="utf-8")
+    accurate_text = accurate_text_path.read_text(encoding="utf-8")
     inaccurate = load_inaccurate_text_from_stable_ts(trans_path)
     threshold = calibrate_threshold(accurate_text, inaccurate, WINDOW_SIZE)
     anchors = prealign_texts(accurate_text, inaccurate, threshold=threshold)
@@ -609,9 +610,25 @@ def prealign_session(session_dir: Path, language: str = "he") -> None:
 def process_session(
     session_dir: Path,
     model,
+    accurate_text_path: Path,
     language: str,
     force: bool = False,
 ) -> bool:
+    """Run the full pre-align pipeline for a single session/entry.
+
+    Parameters
+    ----------
+    session_dir:
+        Directory containing audio and where outputs are written.
+    model:
+        A loaded stable_whisper model (faster-whisper backend).
+    accurate_text_path:
+        Path to the plain-text file with the accurate transcript.
+    language:
+        Language code (e.g. ``"he"``).
+    force:
+        If ``True``, re-run even if outputs already exist.
+    """
     session_id = session_dir.name
     prealign_path = session_dir / PREALIGN_TRANSCRIPT_FILENAME
     transcript_path = session_dir / TRANSCRIPT_FILENAME
@@ -625,7 +642,7 @@ def process_session(
             logger.info("Session %s: transcribing audio...", session_id)
             transcribe_session(session_dir, model, language=language)
         logger.info("Session %s: timing accurate text...", session_id)
-        prealign_session(session_dir, language=language)
+        prealign_session(session_dir, accurate_text_path, language=language)
         return True
     except Exception as exc:
         logger.error("Pre-align failed for session %s: %s", session_id, exc)
@@ -656,9 +673,18 @@ def _worker_main(
     compute_type: str,
     language: str,
     force: bool,
+    accurate_text_resolver,
     task_queue,
     results_queue,
 ) -> None:
+    """Worker process that loads one model and drains *task_queue*.
+
+    Parameters
+    ----------
+    accurate_text_resolver:
+        A callable ``(session_dir: Path) -> Path`` that returns the path to
+        the accurate plain-text transcript for that session directory.
+    """
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -690,7 +716,14 @@ def _worker_main(
             break
         session_dir = Path(item)
         try:
-            ok = process_session(session_dir, model, language=language, force=force)
+            accurate_text_path = accurate_text_resolver(session_dir)
+            ok = process_session(
+                session_dir,
+                model,
+                accurate_text_path=accurate_text_path,
+                language=language,
+                force=force,
+            )
             results_queue.put((item, ok, None if ok else "process_session returned False"))
         except Exception as exc:
             worker_logger.exception("Session %s crashed", session_dir.name)
@@ -698,12 +731,13 @@ def _worker_main(
 
 
 # ---------------------------------------------------------------------------
-# Public entry point
+# Public batch entry point
 # ---------------------------------------------------------------------------
 
 
 def pre_align_sessions(
     session_dirs: Iterable[Path],
+    accurate_text_resolver,
     devices: str = DEFAULT_PRE_ALIGN_DEVICES,
     model_name: str = DEFAULT_PRE_ALIGN_MODEL,
     compute_type: str = DEFAULT_COMPUTE_TYPE,
@@ -716,9 +750,30 @@ def pre_align_sessions(
     One worker process is spawned per device parsed from the comma-separated
     ``devices`` string.  Workers share a queue of session directory paths.
 
-    Returns a mapping ``{str(session_dir): (ok, error_message_or_None)}``.
-    Raises ``RuntimeError`` after the run if ``abort_on_error`` is set and
-    at least one session failed.
+    Parameters
+    ----------
+    session_dirs:
+        Session directories to process.
+    accurate_text_resolver:
+        A callable ``(session_dir: Path) -> Path`` that returns the path to
+        the accurate plain-text transcript for that session directory.
+    devices:
+        Comma-separated device list (e.g. ``"cuda:0,cuda:1"``).
+    model_name:
+        Whisper model name for faster-whisper.
+    compute_type:
+        faster-whisper compute type.
+    language:
+        Language code.
+    force:
+        Re-run even if outputs exist.
+    abort_on_error:
+        Raise ``RuntimeError`` if any session fails.
+
+    Returns
+    -------
+    dict[str, tuple[bool, Optional[str]]]
+        Mapping ``{str(session_dir): (ok, error_message_or_None)}``.
     """
     device_list = [d.strip() for d in devices.split(",") if d.strip()]
     if not device_list:
@@ -764,6 +819,7 @@ def pre_align_sessions(
                 compute_type,
                 language,
                 force,
+                accurate_text_resolver,
                 task_queue,
                 results_queue,
             ),
