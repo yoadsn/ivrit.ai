@@ -1,25 +1,24 @@
 """Create maps stage for Knesset committee sessions.
 
-After the normalize (alignment) stage produces ``transcript.aligned.json``,
-this stage maps each aligned segment back to ``raw.protocol.txt`` and the
-speaker segments extracted during protocol parsing.
+After the normalize (alignment) stage produces ``transcript.aligned.json``
+and optionally after the refine-segments stage produces
+``transcript.refined.json``, this stage maps each segment back to
+``raw.protocol.txt`` and the speaker segments extracted during protocol
+parsing.
 
-The aligned transcript segments carry text that originates from
-``raw.protocol.txt`` and appears **in order** (though alignment may have
-slightly altered segment boundaries).  We exploit this sequential property
-with an overlap sweep: for each segment we search forward from the last
-match position in ``raw.protocol.txt`` to find the matching character span.
+Produces one map file for each transcript that exists:
 
-Produces:
+* ``transcript.aligned.map.json`` — parallel to ``transcript.aligned.json``
+* ``transcript.refined.map.json``  — parallel to ``transcript.refined.json``
+  (only written when ``transcript.refined.json`` is present)
 
-* ``transcript.aligned.map.json`` — a JSON array parallel to the segments
-  in ``transcript.aligned.json``.  Each entry is::
+Each map entry is::
 
-      {"start_char": <int>, "end_char": <int>, "speaker_ids": [<int>, ...]}
+    {"start_char": <int>, "end_char": <int>, "speaker_ids": [<int>, ...]}
 
-  ``start_char`` / ``end_char`` index into ``raw.protocol.txt``.
-  ``speaker_ids`` lists the speakers whose char span in
-  ``speakers.segments.txt`` overlaps with this segment.
+``start_char`` / ``end_char`` index into ``raw.protocol.txt``.
+``speaker_ids`` lists the speakers whose char span in
+``speakers.segments.txt`` overlaps with this segment.
 
 Public entry points:
 
@@ -42,8 +41,16 @@ logger = logging.getLogger(__name__)
 
 RAW_PROTOCOL_FILENAME = "raw.protocol.txt"
 ALIGNED_TRANSCRIPT_FILENAME = "transcript.aligned.json"
+REFINED_TRANSCRIPT_FILENAME = "transcript.refined.json"
 SPEAKERS_SEGMENTS_FILENAME = "speakers.segments.txt"
 ALIGNED_MAP_FILENAME = "transcript.aligned.map.json"
+REFINED_MAP_FILENAME = "transcript.refined.map.json"
+
+# Maps each transcript filename to its corresponding map output filename.
+TRANSCRIPT_MAP_PAIRS: list[tuple[str, str]] = [
+    (ALIGNED_TRANSCRIPT_FILENAME, ALIGNED_MAP_FILENAME),
+    (REFINED_TRANSCRIPT_FILENAME, REFINED_MAP_FILENAME),
+]
 
 
 # ---------------------------------------------------------------------------
@@ -60,7 +67,7 @@ def add_create_maps_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--force-create-maps",
         action="store_true",
-        help="Force re-creation of the aligned map even if it already exists.",
+        help="Force re-creation of the transcript maps even if they already exist.",
     )
 
 
@@ -189,37 +196,38 @@ def _assign_speakers(
 
 
 # ---------------------------------------------------------------------------
-# Per-session processing
+# Per-transcript processing
 # ---------------------------------------------------------------------------
 
 
-def create_maps_for_session(
+def _create_map_for_transcript(
     session_dir: pathlib.Path,
-    force: bool = False,
+    transcript_filename: str,
+    map_filename: str,
+    protocol_text: str,
+    spk_segments: list[tuple[int, int, int]],
+    force: bool,
 ) -> bool:
-    """Create ``transcript.aligned.map.json`` for one session.
+    """Build one map file from a single transcript.
 
-    Returns True on success, False on failure / skip.
+    Returns ``True`` on success (including skip), ``False`` on failure.
     """
     session_id = session_dir.name
-    map_path = session_dir / ALIGNED_MAP_FILENAME
+    transcript_path = session_dir / transcript_filename
+    map_path = session_dir / map_filename
 
-    if map_path.exists() and not force:
-        logger.info("Session %s: aligned map already exists; skipping.", session_id)
+    if not transcript_path.exists():
+        # Not present — nothing to do (not an error).
         return True
 
-    protocol_path = session_dir / RAW_PROTOCOL_FILENAME
-    aligned_path = session_dir / ALIGNED_TRANSCRIPT_FILENAME
+    if map_path.exists() and not force:
+        logger.info(
+            "Session %s: %s already exists; skipping.",
+            session_id, map_filename,
+        )
+        return True
 
-    if not protocol_path.exists():
-        logger.warning("Session %s: %s not found; skipping maps.", session_id, RAW_PROTOCOL_FILENAME)
-        return False
-    if not aligned_path.exists():
-        logger.warning("Session %s: %s not found; skipping maps.", session_id, ALIGNED_TRANSCRIPT_FILENAME)
-        return False
-
-    protocol_text = protocol_path.read_text(encoding="utf-8")
-    aligned_data = json.loads(aligned_path.read_text(encoding="utf-8"))
+    aligned_data = json.loads(transcript_path.read_text(encoding="utf-8"))
     segments = aligned_data.get("segments", [])
 
     # Sequential sweep: find each segment's text in the protocol.
@@ -240,17 +248,16 @@ def create_maps_for_session(
             search_from = max(search_from, start_char + 1)
         else:
             logger.warning(
-                "Session %s: could not locate segment %d in protocol text (len=%d, text=%.60s...).",
-                session_id, idx, len(seg_text), seg_text[:60],
+                "Session %s: could not locate segment %d in protocol text "
+                "(transcript=%s, len=%d, text=%.60s...).",
+                session_id, idx, transcript_filename, len(seg_text), seg_text[:60],
             )
             # Insert a placeholder with -1 to signal unmapped.
             char_spans.append((-1, -1))
             map_entries.append({"start_char": -1, "end_char": -1, "speaker_ids": []})
 
     # Assign speakers.
-    spk_segments = _load_speaker_segments(session_dir)
     if spk_segments:
-        # Only pass valid spans for speaker assignment; keep -1 entries as-is.
         valid_indices = [i for i, (s, e) in enumerate(char_spans) if s >= 0]
         valid_spans = [char_spans[i] for i in valid_indices]
         if valid_spans:
@@ -261,8 +268,61 @@ def create_maps_for_session(
     map_path.write_text(
         json.dumps(map_entries, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    logger.info("Session %s: wrote %s with %d entries.", session_id, ALIGNED_MAP_FILENAME, len(map_entries))
+    logger.info(
+        "Session %s: wrote %s with %d entries.",
+        session_id, map_filename, len(map_entries),
+    )
     return True
+
+
+# ---------------------------------------------------------------------------
+# Per-session processing
+# ---------------------------------------------------------------------------
+
+
+def create_maps_for_session(
+    session_dir: pathlib.Path,
+    force: bool = False,
+) -> bool:
+    """Create map files for all transcripts present in *session_dir*.
+
+    Processes ``transcript.aligned.json`` → ``transcript.aligned.map.json``
+    and, if it exists, ``transcript.refined.json`` → ``transcript.refined.map.json``.
+
+    Returns True if all attempted maps succeeded, False otherwise.
+    """
+    session_id = session_dir.name
+    protocol_path = session_dir / RAW_PROTOCOL_FILENAME
+
+    if not protocol_path.exists():
+        logger.warning("Session %s: %s not found; skipping maps.", session_id, RAW_PROTOCOL_FILENAME)
+        return False
+
+    # Check that at least the base aligned transcript exists.
+    if not (session_dir / ALIGNED_TRANSCRIPT_FILENAME).exists():
+        logger.warning(
+            "Session %s: %s not found; skipping maps.",
+            session_id, ALIGNED_TRANSCRIPT_FILENAME,
+        )
+        return False
+
+    protocol_text = protocol_path.read_text(encoding="utf-8")
+    spk_segments = _load_speaker_segments(session_dir)
+
+    all_ok = True
+    for transcript_filename, map_filename in TRANSCRIPT_MAP_PAIRS:
+        ok = _create_map_for_transcript(
+            session_dir,
+            transcript_filename,
+            map_filename,
+            protocol_text,
+            spk_segments,
+            force=force,
+        )
+        if not ok:
+            all_ok = False
+
+    return all_ok
 
 
 # ---------------------------------------------------------------------------
@@ -278,8 +338,9 @@ def create_maps_sessions(
 ) -> None:
     """Run the create-maps stage for all sessions under *input_folder*.
 
-    Iterates over subdirectories of *input_folder* that contain an aligned
-    transcript and produces ``transcript.aligned.map.json`` for each.
+    For each session that has ``transcript.aligned.json`` this produces
+    ``transcript.aligned.map.json``.  If ``transcript.refined.json`` also
+    exists, ``transcript.refined.map.json`` is produced as well.
     """
     if not input_folder.is_dir():
         logger.warning("Input folder %s does not exist.", input_folder)

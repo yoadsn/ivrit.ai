@@ -8,6 +8,7 @@ from tqdm import tqdm
 
 from sources.knesset.committee.create_maps import add_create_maps_args, create_maps_sessions
 from sources.knesset.committee.extraction import is_extracted, process_protocol
+from sources.knesset.committee.manifest import build_manifest
 from sources.knesset.committee.metadata import (
     CommitteeMetadata,
     committee_source_id,
@@ -15,6 +16,8 @@ from sources.knesset.committee.metadata import (
 )
 from sources.knesset.committee.normalize import add_normalize_args, normalize_sessions
 from sources.knesset.committee.pre_align import add_prealign_args, pre_align_sessions
+from sources.knesset.committee.refine_segments import add_refine_segments_args, refine_segments_sessions
+from sources.knesset.committee.vad import add_vad_args, vad_sessions
 from sources.knesset.committee.s3 import make_s3_client, s3_download, s3_uri_filename
 from utils.audio import get_audio_info
 
@@ -163,14 +166,21 @@ def main() -> None:
         help="AWS region (falls back to env / config).",
     )
 
-    # Pre-align, normalization, and create-maps tunables.
+    # Pre-align, normalization, VAD, and create-maps tunables.
     add_prealign_args(parser)
     add_normalize_args(parser)
+    add_vad_args(parser)
+    add_refine_segments_args(parser)
     add_create_maps_args(parser)
     parser.add_argument(
         "--skip-normalize",
         action="store_true",
         help="Skip the normalize (alignment + quality scoring) stage.",
+    )
+    parser.add_argument(
+        "--skip-manifest",
+        action="store_true",
+        help="Skip generating the output manifest CSV.",
     )
 
     args = parser.parse_args()
@@ -311,6 +321,20 @@ def main() -> None:
                 raise
             tqdm.write(" - Skipping to next session")
 
+    # --- VAD stage (frame-level voice activity detection) ---
+    if not args.skip_vad and not args.skip_audio:
+        print("Running VAD predictions...")
+        vad_sessions(
+            output_dir,
+            force=args.force_vad or args.force_normalize_reprocess or args.force_pre_align,
+            session_ids=args.session_ids,
+            abort_on_error=args.abort_on_error,
+            pretranscode_workers=args.vad_pretranscode_workers,
+            presplit_workers=args.vad_presplit_workers,
+            presplit_max_duration=args.vad_presplit_max_duration,
+            chunk_size=args.vad_chunk_size,
+        )
+
     # --- Pre-align stage (batch, one worker per device) ---
     if ready_session_dirs and not args.skip_pre_align and not args.skip_audio:
         print(f"Pre-aligning {len(ready_session_dirs)} session(s)...")
@@ -340,15 +364,32 @@ def main() -> None:
             abort_on_error=args.abort_on_error,
         )
 
-    # --- Create maps stage (char offsets + speaker IDs for aligned segments) ---
+    # --- Refine segments stage (adjust segment boundaries using VAD) ---
+    if not args.skip_refine_segments and not args.skip_audio:
+        print("Refining segment boundaries...")
+        refine_segments_sessions(
+            output_dir,
+            force=args.force_refine_segments or args.force_vad or args.force_normalize_reprocess or args.force_pre_align,
+            session_ids=args.session_ids,
+            abort_on_error=args.abort_on_error,
+            min_gap_to_adjust=args.refine_segments_min_gap,
+            workers=args.refine_segments_workers,
+        )
+
+    # --- Create maps stage (char offsets + speaker IDs for aligned/refined segments) ---
     if not args.skip_create_maps:
-        print("Creating aligned transcript maps...")
+        print("Creating transcript maps...")
         create_maps_sessions(
             output_dir,
-            force=args.force_create_maps or args.force_normalize_reprocess or args.force_pre_align,
+            force=args.force_create_maps or args.force_refine_segments or args.force_normalize_reprocess or args.force_pre_align,
             session_ids=args.session_ids,
             abort_on_error=args.abort_on_error,
         )
+
+    # --- Build manifest stage ---
+    if not args.skip_manifest:
+        print("Generating manifest CSV...")
+        build_manifest(str(output_dir))
 
 
 if __name__ == "__main__":

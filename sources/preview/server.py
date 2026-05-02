@@ -2,6 +2,7 @@
 # requires-python = ">=3.12"
 # dependencies = [
 #     "fastapi[standard]",
+#     "stable-ts",
 # ]
 # ///
 """
@@ -27,6 +28,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse
+from stable_whisper import WhisperResult  # type: ignore  # provided by stable-ts
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -84,21 +86,42 @@ log.info("Data directory : %s", DATA_DIR)
 log.info("Audio filename : %s", AUDIO_FILENAME)
 
 # ---------------------------------------------------------------------------
-# Transcript fallback chain
+# Transcript resolution
 # ---------------------------------------------------------------------------
-_TRANSCRIPT_CANDIDATES = [
+# "aligned" mode: always transcript.aligned.json (fallback chain for older data)
+# "refined" mode: transcript.refined.json if present, otherwise transcript.aligned.json
+_ALIGNED_CANDIDATES = [
     "transcript.aligned.json",
     "transcript.json",
     "prealign.transcript.json",
 ]
+_REFINED_FILENAME = "transcript.refined.json"
+
+# Map transcript filename -> its map file
+_MAP_FOR_TRANSCRIPT = {
+    "transcript.aligned.json": "transcript.aligned.map.json",
+    "transcript.refined.json": "transcript.refined.map.json",
+}
 
 
-def _find_transcript(session_dir: Path) -> Path | None:
-    for name in _TRANSCRIPT_CANDIDATES:
+def _find_aligned_transcript(session_dir: Path) -> Path | None:
+    for name in _ALIGNED_CANDIDATES:
         p = session_dir / name
         if p.exists():
             return p
     return None
+
+
+def _find_transcript(session_dir: Path, mode: str = "refined") -> Path | None:
+    """Return the transcript path for *mode* ('aligned' or 'refined').
+
+    'refined' falls back to the aligned transcript when no refined file exists.
+    """
+    if mode == "refined":
+        refined = session_dir / _REFINED_FILENAME
+        if refined.exists():
+            return refined
+    return _find_aligned_transcript(session_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -121,7 +144,7 @@ def _load_sessions() -> None:
     for entry in sorted(DATA_DIR.iterdir()):
         if not entry.is_dir():
             continue
-        transcript_path = _find_transcript(entry)
+        transcript_path = _find_aligned_transcript(entry)
         meta = _read_metadata(entry)
         # Parse date to ISO YYYY-MM-DD
         raw_date = meta.get("session_date", "")
@@ -137,6 +160,7 @@ def _load_sessions() -> None:
                 "has_audio": (entry / AUDIO_FILENAME).exists(),
                 "has_transcript": transcript_path is not None,
                 "transcript_file": transcript_path.name if transcript_path else None,
+                "has_refined": (entry / _REFINED_FILENAME).exists(),
                 "has_speakers": (entry / "speakers.txt").exists(),
                 "has_map": (entry / "transcript.aligned.map.json").exists(),
             }
@@ -198,51 +222,21 @@ def list_sessions():
     return sessions
 
 
-@app.get("/api/session/{session_id}/transcript")
-def get_transcript(session_id: str):
-    """Return transcript segments with timing and optional speaker info.
-
-    Resolves the transcript using the fallback chain:
-      transcript.aligned.json -> transcript.json -> prealign.transcript.json
-
-    If transcript.aligned.map.json and speakers.txt exist, each segment
-    is enriched with ``speaker_ids`` and ``speaker_names``.
-    """
-    d = _get_session_dir(session_id)
-    transcript_path = _find_transcript(d)
-    if transcript_path is None:
-        raise HTTPException(status_code=404, detail="No transcript file found")
-
-    data = json.loads(transcript_path.read_text(encoding="utf-8"))
-    segments = data.get("segments", [])
-
-    # Try to load speaker map
-    map_path = d / "transcript.aligned.map.json"
-    speakers_path = d / "speakers.txt"
-    speaker_map: dict[str, str] = {}
-    segment_maps: list[dict] | None = None
-
-    if speakers_path.exists():
-        for line in speakers_path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            parts = line.split("\t", 1)
-            if len(parts) == 2:
-                speaker_map[parts[0]] = parts[1]
-
-    if map_path.exists() and transcript_path.name == "transcript.aligned.json":
-        segment_maps = json.loads(map_path.read_text(encoding="utf-8"))
-
+def _build_transcript_entries(
+    session_id: str,
+    raw_segments: list[dict],
+    speaker_map: dict[str, str],
+    segment_maps: list[dict] | None,
+) -> list[dict]:
+    """Convert raw segment dicts into the API entry format."""
     entries = []
-    for i, seg in enumerate(segments):
+    for i, seg in enumerate(raw_segments):
         entry = {
             "index": i,
             "start": float(seg.get("start", 0)),
             "end": float(seg.get("end", 0)),
             "text": seg.get("text", ""),
         }
-        # Include word-level timing when available
         raw_words = seg.get("words")
         if raw_words:
             words_out = []
@@ -256,7 +250,6 @@ def get_transcript(session_id: str):
                     wd["probability"] = float(w["probability"])
                 words_out.append(wd)
             entry["words"] = words_out
-        # Attach speaker info from map if available
         if segment_maps is not None and i < len(segment_maps):
             m = segment_maps[i]
             sids = m.get("speaker_ids", [])
@@ -265,13 +258,137 @@ def get_transcript(session_id: str):
                 speaker_map.get(str(sid), f"Unknown ({sid})") for sid in sids
             ]
         entries.append(entry)
+    return entries
+
+
+@app.get("/api/session/{session_id}/transcript")
+def get_transcript(session_id: str, mode: str = "refined"):
+    """Return transcript segments with timing and optional speaker info.
+
+    Query params:
+      mode (str) – 'refined' (default) or 'aligned'.
+        'refined' uses transcript.refined.json when available, falling back to
+        transcript.aligned.json.  'aligned' always uses the aligned transcript.
+
+    The map file is chosen to match the transcript that was loaded.
+
+    Merging (via POST /api/session/{id}/merge) always operates on the aligned
+    transcript and is only shown when mode='aligned'.
+    """
+    if mode not in ("aligned", "refined"):
+        raise HTTPException(status_code=422, detail="mode must be 'aligned' or 'refined'")
+
+    d = _get_session_dir(session_id)
+    transcript_path = _find_transcript(d, mode=mode)
+    if transcript_path is None:
+        raise HTTPException(status_code=404, detail="No transcript file found")
+
+    # Load speaker map
+    speakers_path = d / "speakers.txt"
+    speaker_map: dict[str, str] = {}
+    if speakers_path.exists():
+        for line in speakers_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split("\t", 1)
+            if len(parts) == 2:
+                speaker_map[parts[0]] = parts[1]
+
+    # Merge cache only applies to aligned mode
+    if mode == "aligned":
+        merged = _merged_cache.get(session_id)
+        if merged is not None:
+            entries = _build_transcript_entries(session_id, merged, speaker_map, None)
+            return {
+                "source_file": transcript_path.name + " [merged]",
+                "mode": mode,
+                "segment_count": len(entries),
+                "speakers": speaker_map,
+                "segments": entries,
+                "merged": True,
+            }
+
+    data = json.loads(transcript_path.read_text(encoding="utf-8"))
+    raw_segments = data.get("segments", [])
+
+    # Load the map that corresponds to the transcript we loaded
+    map_filename = _MAP_FOR_TRANSCRIPT.get(transcript_path.name)
+    segment_maps: list[dict] | None = None
+    if map_filename:
+        map_path = d / map_filename
+        if map_path.exists():
+            segment_maps = json.loads(map_path.read_text(encoding="utf-8"))
+
+    entries = _build_transcript_entries(session_id, raw_segments, speaker_map, segment_maps)
 
     return {
         "source_file": transcript_path.name,
+        "mode": mode,
         "segment_count": len(entries),
         "speakers": speaker_map,
         "segments": entries,
+        "merged": False,
     }
+
+
+@app.post("/api/session/{session_id}/merge")
+def merge_transcript(session_id: str, gap: float):
+    """Apply merge_by_gap to the aligned transcript and cache the result.
+
+    Merging always operates on transcript.aligned.json (the stable base).
+    The result is returned when the transcript endpoint is called with mode=aligned.
+
+    Query param:
+      gap (float) – maximum gap in seconds between segments to merge.
+    """
+    if gap < 0:
+        raise HTTPException(status_code=422, detail="gap must be >= 0")
+
+    d = _get_session_dir(session_id)
+    transcript_path = _find_aligned_transcript(d)
+    if transcript_path is None:
+        raise HTTPException(status_code=404, detail="No transcript file found")
+
+    log.info("merge_by_gap(%.2f) for session %s …", gap, session_id)
+    result = WhisperResult(str(transcript_path))
+    result.merge_by_gap(gap, max_words=25)
+
+    # Extract merged segments as plain dicts
+    merged_segs = []
+    for seg in result.segments:
+        seg_dict: dict = {
+            "start": float(seg.start),
+            "end": float(seg.end),
+            "text": seg.text,
+        }
+        if seg.words:
+            seg_dict["words"] = [
+                {
+                    "word": w.word,
+                    "start": float(w.start),
+                    "end": float(w.end),
+                    **( {"probability": float(w.probability)} if w.probability is not None else {} ),
+                }
+                for w in seg.words
+            ]
+        merged_segs.append(seg_dict)
+
+    _merged_cache[session_id] = merged_segs
+    log.info(
+        "merge_by_gap(%.2f) produced %d segments for %s",
+        gap, len(merged_segs), session_id,
+    )
+    return {"segment_count": len(merged_segs), "gap": gap}
+
+
+@app.delete("/api/session/{session_id}/merge")
+def reset_merge(session_id: str):
+    """Remove any cached merged transcript, reverting to the original file."""
+    _get_session_dir(session_id)  # validate session exists
+    _merged_cache.pop(session_id, None)
+    log.info("Merge reset for session %s", session_id)
+    return {"reset": True}
 
 
 @app.get("/api/session/{session_id}/speakers")
@@ -296,6 +413,9 @@ def get_speakers(session_id: str):
 # Peaks – waveform data for the frontend
 # ---------------------------------------------------------------------------
 _peaks_cache: dict[str, dict] = {}
+
+# Stores the result of merge_by_gap per session (None = use original file)
+_merged_cache: dict[str, list[dict] | None] = {}
 
 # Target number of peaks across the full audio
 _PEAKS_TARGET = 4000
@@ -598,6 +718,95 @@ _INDEX_HTML = """\
     padding: 1px 6px;
   }
 
+  /* ── Actions panel ── */
+  #actions-panel {
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 8px 24px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-shrink: 0;
+    flex-wrap: wrap;
+  }
+  #actions-panel label {
+    font-size: 13px;
+    color: var(--text-muted);
+    white-space: nowrap;
+  }
+  #input-gap {
+    width: 80px;
+    padding: 3px 8px;
+    font-size: 13px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    font-family: monospace;
+  }
+  #actions-panel button {
+    padding: 3px 12px;
+    font-size: 13px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    cursor: pointer;
+    background: none;
+    color: var(--text);
+  }
+  #actions-panel button:hover { background: var(--bg); }
+  #btn-merge {
+    border-color: var(--primary);
+    color: var(--primary);
+    background: var(--primary-light);
+  }
+  #btn-merge:hover { background: #cfe2ff; }
+  #btn-merge:disabled, #btn-reset:disabled { opacity: 0.5; cursor: not-allowed; }
+  #merge-status {
+    font-size: 12px;
+    color: var(--text-muted);
+    font-style: italic;
+  }
+  #merge-badge {
+    font-size: 11px;
+    background: #ffc107;
+    color: #000;
+    border-radius: 3px;
+    padding: 1px 6px;
+    display: none;
+    font-weight: 600;
+  }
+
+  /* ── Transcript mode toggle ── */
+  .mode-toggle {
+    display: flex;
+    gap: 0;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    overflow: hidden;
+    flex-shrink: 0;
+  }
+  .mode-toggle button {
+    border: none !important;
+    border-radius: 0 !important;
+    padding: 3px 10px;
+    font-size: 12px;
+    cursor: pointer;
+    background: none;
+    color: var(--text-muted);
+  }
+  .mode-toggle button:not(:last-child) {
+    border-right: 1px solid var(--border) !important;
+  }
+  .mode-toggle button.active {
+    background: var(--primary);
+    color: #fff;
+    font-weight: 600;
+  }
+  .mode-toggle button:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+  /* hide merge controls in refined mode */
+  .merge-controls { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+
   /* ── Segment list ── */
   #scroll-container {
     flex: 1;
@@ -702,6 +911,20 @@ _INDEX_HTML = """\
       <button id="btn-zoom-out" style="display:none">Zoom out</button>
     </div>
   </div>
+  <div id="actions-panel">
+    <div class="mode-toggle">
+      <button id="btn-mode-refined" class="active">Refined</button>
+      <button id="btn-mode-aligned">Aligned</button>
+    </div>
+    <div class="merge-controls" id="merge-controls" style="display:none">
+      <label for="input-gap">Merge by gap (s):</label>
+      <input id="input-gap" type="number" min="0" max="60" step="0.01" value="0.10" />
+      <button id="btn-merge">Merge</button>
+      <button id="btn-reset">Reset</button>
+      <span id="merge-badge">MERGED</span>
+      <span id="merge-status"></span>
+    </div>
+  </div>
   <div id="scroll-container">
     <div id="virtual-list"></div>
   </div>
@@ -709,20 +932,28 @@ _INDEX_HTML = """\
 
 <script>
 // ── DOM refs ──
-const $screenGrid      = document.getElementById('screen-grid');
-const $screenDetail    = document.getElementById('screen-detail');
-const $sessionGrid     = document.getElementById('session-grid');
-const $detailTitle     = document.getElementById('detail-title');
-const $detailStatus    = document.getElementById('detail-status');
-const $audio           = document.getElementById('audio');
-const $waveContainer   = document.getElementById('waveform-container');
-const $btnPlay         = document.getElementById('btn-play');
-const $timeDisplay     = document.getElementById('time-display');
-const $playerInfo      = document.getElementById('player-info');
-const $zoomLabel       = document.getElementById('zoom-label');
-const $btnZoomOut      = document.getElementById('btn-zoom-out');
-const $scrollContainer = document.getElementById('scroll-container');
-const $virtualList     = document.getElementById('virtual-list');
+const $screenGrid        = document.getElementById('screen-grid');
+const $screenDetail      = document.getElementById('screen-detail');
+const $sessionGrid       = document.getElementById('session-grid');
+const $detailTitle       = document.getElementById('detail-title');
+const $detailStatus      = document.getElementById('detail-status');
+const $audio             = document.getElementById('audio');
+const $waveContainer     = document.getElementById('waveform-container');
+const $btnPlay           = document.getElementById('btn-play');
+const $timeDisplay       = document.getElementById('time-display');
+const $playerInfo        = document.getElementById('player-info');
+const $zoomLabel         = document.getElementById('zoom-label');
+const $btnZoomOut        = document.getElementById('btn-zoom-out');
+const $scrollContainer   = document.getElementById('scroll-container');
+const $virtualList       = document.getElementById('virtual-list');
+const $inputGap          = document.getElementById('input-gap');
+const $btnMerge          = document.getElementById('btn-merge');
+const $btnReset          = document.getElementById('btn-reset');
+const $mergeStatus       = document.getElementById('merge-status');
+const $mergeBadge        = document.getElementById('merge-badge');
+const $btnModeRefined    = document.getElementById('btn-mode-refined');
+const $btnModeAligned    = document.getElementById('btn-mode-aligned');
+const $mergeControls     = document.getElementById('merge-controls');
 
 function showScreen(name) {
   $screenGrid.classList.toggle('active', name === 'grid');
@@ -739,6 +970,8 @@ let activeWordIdx = -1;
 let renderedRange = { start: -1, end: -1 };
 let segmentElements = new Map();
 let currentSessionId = null;
+let transcriptMode = 'refined';   // 'aligned' | 'refined'
+let sessionHasRefined = false;    // whether the current session has a refined transcript
 
 // WaveSurfer state
 let ws = null;
@@ -752,8 +985,11 @@ const GAP = 4;
 const ZOOM_PAD = 3; // seconds of padding around segment
 
 // ── Load session list ──
+const _sessionMeta = {};  // session_id -> session metadata
 fetch('/api/sessions').then(r => r.json()).then(data => {
   data.forEach(s => {
+    _sessionMeta[s.session_id] = s;
+
     const card = document.createElement('div');
     card.className = 'session-card';
 
@@ -775,7 +1011,8 @@ fetch('/api/sessions').then(r => r.json()).then(data => {
     const bottom = document.createElement('div');
     bottom.className = 'card-bottom';
     const dur = s.duration_minutes != null ? s.duration_minutes + ' min' : 'unknown duration';
-    bottom.textContent = dur;
+    const refinedTag = s.has_refined ? ' · refined' : '';
+    bottom.textContent = dur + refinedTag;
 
     card.appendChild(top);
     card.appendChild(bottom);
@@ -806,6 +1043,29 @@ function probColor(p) {
 let viewOffset = 0;
 let viewDuration = 0;
 let _regionStopHandler = null;
+let _segmentStopTimer = null;
+
+function playRange(startTime, endTime) {
+  // Cancel any pending stop timer
+  if (_segmentStopTimer !== null) {
+    clearTimeout(_segmentStopTimer);
+    _segmentStopTimer = null;
+  }
+  if (_regionStopHandler) {
+    $audio.removeEventListener('timeupdate', _regionStopHandler);
+    _regionStopHandler = null;
+  }
+  $audio.currentTime = startTime;
+  $audio.play();
+  $btnPlay.textContent = 'Pause';
+  // Schedule stop at millisecond accuracy using setTimeout
+  const delayMs = (endTime - startTime) * 1000;
+  _segmentStopTimer = setTimeout(() => {
+    $audio.pause();
+    $btnPlay.textContent = 'Play';
+    _segmentStopTimer = null;
+  }, delayMs);
+}
 
 function destroyWaveSurfer() {
   if (ws) {
@@ -843,8 +1103,10 @@ function _createWS(peaks, dur) {
 
   viewDuration = dur;
 
-  // Click waveform -> seek $audio and play
+  // Click waveform -> seek $audio and play (cancel any segment stop timer)
   ws.on('interaction', (localTime) => {
+    if (_segmentStopTimer !== null) { clearTimeout(_segmentStopTimer); _segmentStopTimer = null; }
+    if (_regionStopHandler) { $audio.removeEventListener('timeupdate', _regionStopHandler); _regionStopHandler = null; }
     const realTime = viewOffset + localTime;
     $audio.currentTime = realTime;
     $audio.play();
@@ -856,22 +1118,7 @@ function _createWS(peaks, dur) {
     e.stopPropagation();
     const realStart = viewOffset + region.start;
     const realEnd = viewOffset + region.end;
-    $audio.currentTime = realStart;
-    $audio.play();
-    $btnPlay.textContent = 'Pause';
-    // Stop at region end
-    if (_regionStopHandler) {
-      $audio.removeEventListener('timeupdate', _regionStopHandler);
-    }
-    _regionStopHandler = () => {
-      if ($audio.currentTime >= realEnd) {
-        $audio.pause();
-        $btnPlay.textContent = 'Play';
-        $audio.removeEventListener('timeupdate', _regionStopHandler);
-        _regionStopHandler = null;
-      }
-    };
-    $audio.addEventListener('timeupdate', _regionStopHandler);
+    playRange(realStart, realEnd);
   });
 
   return ws;
@@ -966,6 +1213,33 @@ function zoomOut() {
   }
 }
 
+// ── Mode toggle helpers ──
+function _updateModeToggleUI() {
+  $btnModeRefined.classList.toggle('active', transcriptMode === 'refined');
+  $btnModeAligned.classList.toggle('active', transcriptMode === 'aligned');
+  // Disable refined button when session has no refined transcript
+  $btnModeRefined.disabled = !sessionHasRefined;
+  // Merge controls only visible in aligned mode
+  $mergeControls.style.display = transcriptMode === 'aligned' ? '' : 'none';
+}
+
+async function switchMode(mode) {
+  if (mode === transcriptMode) return;
+  transcriptMode = mode;
+  _updateModeToggleUI();
+  // Clear merge badge when leaving aligned mode
+  if (mode !== 'aligned') applyMergedState(false, 0, 0);
+  setMergeUIBusy(true);
+  try {
+    await reloadTranscript();
+  } finally {
+    setMergeUIBusy(false);
+  }
+}
+
+$btnModeRefined.addEventListener('click', () => switchMode('refined'));
+$btnModeAligned.addEventListener('click', () => switchMode('aligned'));
+
 // ── Open session ──
 async function openSession(sid) {
   $detailTitle.textContent = sid;
@@ -987,11 +1261,19 @@ async function openSession(sid) {
   peaksData = null;
   $zoomLabel.textContent = 'Full view';
   $btnZoomOut.style.display = 'none';
+  applyMergedState(false, 0, 0);
+  setMergeUIBusy(true); // disable until data loads
+
+  // Set mode: default to 'refined' if available, else 'aligned'
+  const meta = _sessionMeta[sid] || {};
+  sessionHasRefined = !!meta.has_refined;
+  transcriptMode = sessionHasRefined ? 'refined' : 'aligned';
+  _updateModeToggleUI();
 
   try {
     // Fetch transcript and peaks in parallel
     const [transcriptResp, peaksResp] = await Promise.all([
-      fetch('/api/session/' + sid + '/transcript'),
+      fetch('/api/session/' + sid + '/transcript?mode=' + transcriptMode),
       fetch('/api/session/' + sid + '/peaks'),
     ]);
     if (!transcriptResp.ok) throw new Error(await transcriptResp.text());
@@ -1004,6 +1286,12 @@ async function openSession(sid) {
     $playerInfo.textContent =
       data.source_file + ' | ' + data.segment_count + ' segments' +
       (Object.keys(data.speakers).length ? ' | ' + Object.keys(data.speakers).length + ' speakers' : '');
+
+    // Reflect any pre-existing merged state (only relevant in aligned mode)
+    if (transcriptMode === 'aligned') {
+      applyMergedState(!!data.merged, data.segment_count, parseFloat($inputGap.value));
+    }
+    setMergeUIBusy(false);
 
     // Set up audio element and create WaveSurfer with pre-computed peaks
     $audio.src = '/audio/' + sid;
@@ -1026,6 +1314,88 @@ function goBack() {
   showScreen('grid');
 }
 
+// ── Merge / Reset ──
+function setMergeUIBusy(busy) {
+  $btnMerge.disabled = busy;
+  $btnReset.disabled = busy;
+  $inputGap.disabled = busy;
+}
+
+function applyMergedState(isMerged, segCount, gap) {
+  if (isMerged) {
+    $mergeBadge.style.display = '';
+    $mergeStatus.textContent = 'gap=' + gap + 's → ' + segCount + ' segments';
+    $btnReset.style.fontWeight = '600';
+  } else {
+    $mergeBadge.style.display = 'none';
+    $mergeStatus.textContent = '';
+    $btnReset.style.fontWeight = '';
+  }
+}
+
+async function reloadTranscript() {
+  const resp = await fetch('/api/session/' + currentSessionId + '/transcript?mode=' + transcriptMode);
+  if (!resp.ok) throw new Error(await resp.text());
+  const data = await resp.json();
+  segments = data.segments;
+  $playerInfo.textContent =
+    data.source_file + ' | ' + data.segment_count + ' segments' +
+    (Object.keys(data.speakers).length ? ' | ' + Object.keys(data.speakers).length + ' speakers' : '');
+  // Reset virtual list
+  activeSegIdx = -1;
+  activeWordIdx = -1;
+  renderedRange = { start: -1, end: -1 };
+  segmentElements.clear();
+  $virtualList.innerHTML = '';
+  $scrollContainer.scrollTop = 0;
+  initVirtualList();
+  return data;
+}
+
+$btnMerge.addEventListener('click', async () => {
+  if (!currentSessionId) return;
+  const gap = parseFloat($inputGap.value);
+  if (isNaN(gap) || gap < 0) {
+    $mergeStatus.textContent = 'Invalid gap value.';
+    return;
+  }
+  setMergeUIBusy(true);
+  $mergeStatus.textContent = 'Merging…';
+  try {
+    const resp = await fetch(
+      '/api/session/' + currentSessionId + '/merge?gap=' + gap,
+      { method: 'POST' }
+    );
+    if (!resp.ok) throw new Error(await resp.text());
+    const result = await resp.json();
+    const data = await reloadTranscript();
+    applyMergedState(true, result.segment_count, gap);
+  } catch (e) {
+    $mergeStatus.textContent = 'Error: ' + e.message;
+  } finally {
+    setMergeUIBusy(false);
+  }
+});
+
+$btnReset.addEventListener('click', async () => {
+  if (!currentSessionId) return;
+  setMergeUIBusy(true);
+  $mergeStatus.textContent = 'Resetting…';
+  try {
+    const resp = await fetch(
+      '/api/session/' + currentSessionId + '/merge',
+      { method: 'DELETE' }
+    );
+    if (!resp.ok) throw new Error(await resp.text());
+    await reloadTranscript();
+    applyMergedState(false, 0, 0);
+  } catch (e) {
+    $mergeStatus.textContent = 'Error: ' + e.message;
+  } finally {
+    setMergeUIBusy(false);
+  }
+});
+
 document.getElementById('btn-back').addEventListener('click', goBack);
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape' && $screenDetail.classList.contains('active')) goBack();
@@ -1033,6 +1403,8 @@ document.addEventListener('keydown', e => {
 
 // ── Player controls ──
 $btnPlay.addEventListener('click', () => {
+  // Cancel any active segment stop timer when user takes manual control
+  if (_segmentStopTimer !== null) { clearTimeout(_segmentStopTimer); _segmentStopTimer = null; }
   if ($audio.paused) {
     $audio.play();
     $btnPlay.textContent = 'Pause';
@@ -1159,7 +1531,7 @@ function createSegmentEl(i) {
       if (i === activeSegIdx && wi === activeWordIdx) span.classList.add('word-active');
       span.addEventListener('click', e => {
         e.stopPropagation();
-        if (ws) { ws.setTime(w.start); ws.play(); }
+        playRange(w.start, w.end);
         zoomToSegment(i);
       });
       textEl.appendChild(span);
@@ -1169,9 +1541,9 @@ function createSegmentEl(i) {
   }
   el.appendChild(textEl);
 
-  // Click segment -> zoom waveform to it and play
+  // Click segment -> zoom waveform to it and play the segment range
   el.addEventListener('click', () => {
-    if (ws) { ws.setTime(seg.start); ws.play(); }
+    playRange(seg.start, seg.end);
     zoomToSegment(i);
   });
 
