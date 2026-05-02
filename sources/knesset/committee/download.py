@@ -401,6 +401,7 @@ def main() -> None:
             force=args.force_create_maps or args.force_refine_segments or args.force_normalize_reprocess or args.force_pre_align,
             session_ids=args.session_ids,
             abort_on_error=args.abort_on_error,
+            workers=args.create_maps_workers,
         )
 
     # --- Build manifest stage ---

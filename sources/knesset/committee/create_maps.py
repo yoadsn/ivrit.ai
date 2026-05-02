@@ -33,6 +33,7 @@ import argparse
 import json
 import logging
 import pathlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
 from tqdm import tqdm
@@ -68,6 +69,12 @@ def add_create_maps_args(parser: argparse.ArgumentParser) -> None:
         "--force-create-maps",
         action="store_true",
         help="Force re-creation of the transcript maps even if they already exist.",
+    )
+    parser.add_argument(
+        "--create-maps-workers",
+        type=int,
+        default=4,
+        help="Number of parallel workers for the create-maps stage (default: 4).",
     )
 
 
@@ -335,12 +342,18 @@ def create_maps_sessions(
     force: bool = False,
     session_ids: Optional[list[str]] = None,
     abort_on_error: bool = False,
+    workers: int = 4,
 ) -> None:
     """Run the create-maps stage for all sessions under *input_folder*.
 
     For each session that has ``transcript.aligned.json`` this produces
     ``transcript.aligned.map.json``.  If ``transcript.refined.json`` also
     exists, ``transcript.refined.map.json`` is produced as well.
+
+    Parameters
+    ----------
+    workers:
+        Number of parallel threads to use for processing sessions.
     """
     if not input_folder.is_dir():
         logger.warning("Input folder %s does not exist.", input_folder)
@@ -359,17 +372,31 @@ def create_maps_sessions(
         logger.info("No sessions with aligned transcripts found for map creation.")
         return
 
-    print(f"Creating maps for {len(session_dirs)} session(s)...")
-    for session_dir in tqdm(session_dirs, desc="Creating maps"):
-        try:
-            ok = create_maps_for_session(session_dir, force=force)
-            if not ok:
-                tqdm.write(f" - WARNING: map creation skipped/failed for {session_dir.name}")
-                if abort_on_error:
-                    raise RuntimeError(f"Map creation failed for {session_dir.name}")
-        except Exception as e:
-            msg = f" - ERROR: map creation failed for {session_dir.name}: {e}"
-            tqdm.write(msg)
-            logger.error(msg)
-            if abort_on_error:
-                raise
+    print(f"Creating maps for {len(session_dirs)} session(s) with {workers} worker(s)...")
+
+    errors: list[Exception] = []
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_to_dir = {
+            executor.submit(create_maps_for_session, session_dir, force): session_dir
+            for session_dir in session_dirs
+        }
+        with tqdm(total=len(session_dirs), desc="Creating maps") as pbar:
+            for future in as_completed(future_to_dir):
+                session_dir = future_to_dir[future]
+                try:
+                    ok = future.result()
+                    if not ok:
+                        tqdm.write(f" - WARNING: map creation skipped/failed for {session_dir.name}")
+                        if abort_on_error:
+                            raise RuntimeError(f"Map creation failed for {session_dir.name}")
+                except Exception as e:
+                    msg = f" - ERROR: map creation failed for {session_dir.name}: {e}"
+                    tqdm.write(msg)
+                    logger.error(msg)
+                    errors.append(e)
+                finally:
+                    pbar.update(1)
+
+    if errors and abort_on_error:
+        raise errors[0]
