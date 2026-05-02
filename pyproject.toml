@@ -17,8 +17,8 @@ dependencies = [
     "pydub",
     "sortedcontainers",
     "soundfile",
-    "torch",
-    "torchaudio",
+    "torch>=2.0,<2.11",
+    "torchaudio>=2.0,<2.11",
     "transformers",
     "feedparser",
     "openai",
@@ -43,6 +43,12 @@ dependencies = [
 sources-preview = [
     "fastapi[standard]",
 ]
+
+[tool.uv]
+# CUDA 12.4 wheels are the latest that work with driver 575 (CUDA 12.9 API).
+# PyTorch 2.11+ requires CUDA 13.0 (driver >= 576) which is not available here.
+index-url = "https://download.pytorch.org/whl/cu124"
+extra-index-url = ["https://pypi.org/simple"]
 
 [tool.black]
 line-length = 120
