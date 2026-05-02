@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 import numpy as np
+from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -828,14 +829,19 @@ def pre_align_sessions(
         p.start()
         workers.append(p)
 
-    remaining = len(pending)
     first_error: Optional[str] = None
-    while remaining > 0:
-        session_dir_str, ok, err = results_queue.get()
-        results[session_dir_str] = (ok, err)
-        remaining -= 1
-        if not ok and first_error is None and abort_on_error:
-            first_error = f"Pre-align failed for {session_dir_str}: {err}"
+    failed = 0
+    with tqdm(total=len(pending), unit="session", desc="Pre-aligning") as pbar:
+        for _ in range(len(pending)):
+            session_dir_str, ok, err = results_queue.get()
+            results[session_dir_str] = (ok, err)
+            if not ok:
+                failed += 1
+                tqdm.write(f" - Pre-align failed for {Path(session_dir_str).name}: {err}")
+                if first_error is None and abort_on_error:
+                    first_error = f"Pre-align failed for {session_dir_str}: {err}"
+            pbar.set_postfix(failed=failed)
+            pbar.update(1)
 
     for p in workers:
         p.join()
