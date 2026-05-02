@@ -375,6 +375,7 @@ def main() -> None:
             presplit_workers=args.vad_presplit_workers,
             presplit_max_duration=args.vad_presplit_max_duration,
             chunk_size=args.vad_chunk_size,
+            devices=args.vad_devices,
         )
 
     # --- Pre-align stage (batch, one worker per device) ---

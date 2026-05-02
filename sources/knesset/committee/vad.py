@@ -19,12 +19,13 @@ from __future__ import annotations
 
 import argparse
 import logging
+import multiprocessing
+import os
 import pathlib
 
 from tqdm import tqdm
 
 from vad.definitions import VAD_SPEECH_PROBS_FILENAME
-from vad.frame_vad_infer import generate_frame_vad_predictions
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +70,17 @@ def add_vad_args(parser: argparse.ArgumentParser) -> None:
         default=200,
         help="Number of audio files to send to the VAD model per chunk.",
     )
+    parser.add_argument(
+        "--vad-devices",
+        nargs="+",
+        default=None,
+        metavar="DEVICE",
+        help=(
+            "CUDA device IDs to use for VAD (e.g. cuda:0 cuda:1). "
+            "Each device runs in a separate process. "
+            "Defaults to a single process using whatever device the VAD library selects."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -91,6 +103,57 @@ def _has_vad_output(session_dir: pathlib.Path) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Process-parallel worker (one process per GPU)
+# ---------------------------------------------------------------------------
+
+
+def _vad_worker(
+    audio_files: list[str],
+    output_dir: str,
+    config: dict,
+    device: str | None,
+    worker_index: int = 0,
+) -> None:
+    """Run VAD for a subset of *audio_files* inside a worker process.
+
+    If *device* is given (e.g. ``"cuda:1"``), the CUDA device index is
+    extracted and applied via ``CUDA_VISIBLE_DEVICES`` **before** importing
+    any CUDA-aware library, so the module-level ``device`` in
+    ``vad/frame_vad_infer.py`` naturally picks the correct GPU.
+
+    *worker_index* is appended to the temporary processing directory name so
+    that concurrent worker processes do not share ``vad_temp_processing/`` and
+    race on manifests, transcoded audio files, or NeMo intermediate outputs.
+    Note: with ``sibling_mode=True`` the final ``speech_probs.frame`` files are
+    written next to each audio file, so the per-worker ``output_dir`` only
+    affects the temp directory location -- not the final outputs.
+    """
+    if device is not None:
+        # ``cuda:N`` -> restrict this process to GPU N.
+        # For plain ``"cuda"`` or ``"cpu"`` leave the env var alone.
+        if ":" in device:
+            gpu_index = device.split(":", 1)[1]
+            os.environ["CUDA_VISIBLE_DEVICES"] = gpu_index
+
+    # Give each worker its own temp subdirectory so concurrent processes don't
+    # collide on vad_temp_processing/ (manifests, transcoded WAVs, NeMo
+    # intermediate files, frame predictions, and the final rmtree).
+    worker_output_dir = os.path.join(output_dir, f"_vad_worker_{worker_index}")
+
+    # Import *after* setting CUDA_VISIBLE_DEVICES so the VAD library sees it.
+    from vad.frame_vad_infer import generate_frame_vad_predictions  # noqa: PLC0415
+
+    chunk_size = config.get("_chunk_size", 200)
+    for i in range(0, len(audio_files), chunk_size):
+        chunk = audio_files[i : i + chunk_size]
+        print(
+            f"[{device or 'default'}] Processing VAD chunk: "
+            f"{len(chunk)} file(s) (starting at index {i})"
+        )
+        generate_frame_vad_predictions(chunk, worker_output_dir, config, sibling_mode=True)
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -105,6 +168,7 @@ def vad_sessions(
     presplit_workers: int = 1,
     presplit_max_duration: int = 400,
     chunk_size: int = 200,
+    devices: list[str] | None = None,
 ) -> None:
     """Generate frame-level VAD predictions for committee sessions.
 
@@ -126,6 +190,12 @@ def vad_sessions(
         Max seconds per audio chunk sent to the model.
     chunk_size:
         How many files to batch into a single VAD model invocation.
+    devices:
+        CUDA device IDs (e.g. ``["cuda:0", "cuda:1"]``).  When more than one
+        device is supplied, audio files are split evenly across processes --
+        one process per device -- each with ``CUDA_VISIBLE_DEVICES`` set so
+        the VAD library targets the right GPU.  ``None`` / single-device
+        falls back to single-process behaviour.
     """
 
     # Discover sessions that have audio and (optionally) filter by ID.
@@ -158,17 +228,64 @@ def vad_sessions(
         "nemo_vad_pretranscode_workers": pretranscode_workers,
         "nemo_vad_presplit_workers": presplit_workers,
         "nemo_vad_presplit_duration": presplit_max_duration,
+        # Pass chunk_size into workers so they can iterate correctly.
+        "_chunk_size": chunk_size,
     }
 
-    # Process in chunks to limit temp storage and ease recovery.
-    for i in range(0, len(audio_files), chunk_size):
-        chunk = audio_files[i : i + chunk_size]
-        print(f"Processing VAD chunk: {len(chunk)} file(s) (starting at index {i})")
+    # ------------------------------------------------------------------
+    # Single-device path (no parallelism needed).
+    # ------------------------------------------------------------------
+    if not devices or len(devices) <= 1:
+        device = devices[0] if devices else None
         try:
-            generate_frame_vad_predictions(chunk, str(output_dir), config, sibling_mode=True)
+            _vad_worker(audio_files, str(output_dir), config, device, worker_index=0)
         except Exception as e:
-            msg = f"VAD processing failed for chunk starting at index {i}: {e}"
+            msg = f"VAD processing failed: {e}"
             logger.error(msg)
             tqdm.write(f" - ERROR: {msg}")
             if abort_on_error:
                 raise
+        return
+
+    # ------------------------------------------------------------------
+    # Multi-device path: one process per device.
+    # ------------------------------------------------------------------
+    num_devices = len(devices)
+    # Partition files as evenly as possible across devices.
+    partitions: list[list[str]] = [[] for _ in range(num_devices)]
+    for idx, f in enumerate(audio_files):
+        partitions[idx % num_devices].append(f)
+
+    print(
+        f"Distributing VAD across {num_devices} device(s): "
+        + ", ".join(
+            f"{dev} ({len(p)} file(s))" for dev, p in zip(devices, partitions)
+        )
+    )
+
+    ctx = multiprocessing.get_context("spawn")
+    processes: list[multiprocessing.Process] = []
+    for worker_index, (device, partition) in enumerate(zip(devices, partitions)):
+        if not partition:
+            continue
+        p = ctx.Process(
+            target=_vad_worker,
+            args=(partition, str(output_dir), config, device, worker_index),
+            daemon=False,
+        )
+        p.start()
+        processes.append(p)
+
+    errors: list[str] = []
+    for p in processes:
+        p.join()
+        if p.exitcode != 0:
+            msg = f"VAD worker for process PID {p.pid} exited with code {p.exitcode}"
+            logger.error(msg)
+            errors.append(msg)
+
+    if errors:
+        combined = "; ".join(errors)
+        tqdm.write(f" - ERROR: {combined}")
+        if abort_on_error:
+            raise RuntimeError(combined)
