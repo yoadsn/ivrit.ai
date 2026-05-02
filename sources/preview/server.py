@@ -1026,8 +1026,8 @@ fetch('/api/sessions').then(r => r.json()).then(data => {
 function fmtTime(s) {
   const m = Math.floor(s / 60);
   const sec = Math.floor(s % 60);
-  const ms = Math.floor((s % 1) * 10);
-  return String(m).padStart(2, '0') + ':' + String(sec).padStart(2, '0') + '.' + ms;
+  const ms = Math.floor((s % 1) * 1000);
+  return String(m).padStart(2, '0') + ':' + String(sec).padStart(2, '0') + '.' + String(ms).padStart(3, '0');
 }
 function probColor(p) {
   const r = Math.round(0xFD + (0x3C - 0xFD) * p);
