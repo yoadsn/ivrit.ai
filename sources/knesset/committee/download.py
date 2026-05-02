@@ -2,6 +2,8 @@ import argparse
 import csv
 import logging
 import pathlib
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from logging.handlers import RotatingFileHandler
 
 from tqdm import tqdm
@@ -161,6 +163,12 @@ def main() -> None:
         type=str,
         help="Folder to store log files. If not specified, logging is disabled.",
     )
+    parser.add_argument(
+        "--download-workers",
+        type=int,
+        default=4,
+        help="Number of parallel workers for downloading and extracting sessions (default: 4).",
+    )
 
     # AWS credential overrides.  When omitted, boto3 falls back to the
     # standard credential chain (env vars, ~/.aws/credentials, IAM role).
@@ -255,88 +263,105 @@ def main() -> None:
 
     logging.info("Processing %d sessions.", len(manifest_entries))
 
-    s3 = make_s3_client(
-        aws_access_key_id=args.aws_access_key_id,
-        aws_secret_access_key=args.aws_secret_access_key,
-        aws_region=args.aws_region,
-    )
+    # Each worker thread gets its own S3 client to avoid boto3 thread-safety issues.
+    _thread_local = threading.local()
 
-    ready_session_dirs: list[pathlib.Path] = []
+    def _get_s3():
+        if not hasattr(_thread_local, "client"):
+            _thread_local.client = make_s3_client(
+                aws_access_key_id=args.aws_access_key_id,
+                aws_secret_access_key=args.aws_secret_access_key,
+                aws_region=args.aws_region,
+            )
+        return _thread_local.client
 
-    for entry in tqdm(manifest_entries, desc="Processing sessions"):
+    def _process_session(entry: dict) -> pathlib.Path | None:
+        """Download + extract one session. Returns session dir on success, None on skip/error."""
         session_id = entry["session_id"]
         session_output_dir = output_dir / session_id
+        s3 = _get_s3()
 
-        try:
-            session_output_dir.mkdir(parents=True, exist_ok=True)
+        session_output_dir.mkdir(parents=True, exist_ok=True)
 
-            # --- 1. Download protocol archive ---
-            tqdm.write(f" - Downloading protocol for session {session_id}...")
-            protocol_path = ensure_protocol_downloaded(
+        # --- 1. Download protocol archive ---
+        tqdm.write(f" - Downloading protocol for session {session_id}...")
+        protocol_path = ensure_protocol_downloaded(
+            s3,
+            entry["protocol_file_path"],
+            session_output_dir,
+            force=args.force_download,
+        )
+
+        # --- 2. Download audio (optional) ---
+        if not args.skip_audio:
+            tqdm.write(f" - Downloading audio for session {session_id}...")
+            ensure_audio_downloaded(
                 s3,
-                entry["protocol_file_path"],
+                entry["audio_file_path"],
                 session_output_dir,
                 force=args.force_download,
             )
 
-            # --- 2. Download audio (optional) ---
-            if not args.skip_audio:
-                tqdm.write(f" - Downloading audio for session {session_id}...")
-                ensure_audio_downloaded(
-                    s3,
-                    entry["audio_file_path"],
-                    session_output_dir,
-                    force=args.force_download,
-                )
-
-            # --- 3. Extract protocol artifacts ---
-            tqdm.write(f" - Extracting protocol for session {session_id}...")
-            extract_ok = process_protocol(
-                protocol_path,
-                session_output_dir,
-                force_reprocess=args.force_extract,
-            )
-            if not extract_ok:
-                msg = f" - ERROR: extraction failed for session {session_id}."
-                tqdm.write(msg)
-                logging.warning(msg)
-                if args.abort_on_error:
-                    raise RuntimeError(msg)
-                continue
-
-            if not is_extracted(session_output_dir):
-                # Defensive: extraction reported success but output is missing.
-                msg = f" - ERROR: extracted outputs missing for session {session_id}."
-                tqdm.write(msg)
-                logging.warning(msg)
-                if args.abort_on_error:
-                    raise RuntimeError(msg)
-                continue
-
-            # --- 4. Write session metadata ---
-            duration = get_audio_duration(session_output_dir) if not args.skip_audio else None
-            session_metadata = CommitteeMetadata(
-                source_type=source_type,
-                source_id=committee_source_id,
-                source_entry_id=session_id,
-                session_id=session_id,
-                session_date=entry.get("start_date") or None,
-                language="he",
-                duration=duration,
-            )
-            metadata_file = session_output_dir / "metadata.json"
-            with open(metadata_file, "w", encoding="utf-8") as f:
-                f.write(session_metadata.model_dump_json(indent=2))
-
-            ready_session_dirs.append(session_output_dir)
-            tqdm.write(f" - Successfully processed session {session_id}")
-        except Exception as e:
-            msg = f" - ERROR: Unexpected error processing session {session_id}: {e}"
+        # --- 3. Extract protocol artifacts ---
+        tqdm.write(f" - Extracting protocol for session {session_id}...")
+        extract_ok = process_protocol(
+            protocol_path,
+            session_output_dir,
+            force_reprocess=args.force_extract,
+        )
+        if not extract_ok:
+            msg = f" - ERROR: extraction failed for session {session_id}."
             tqdm.write(msg)
             logging.warning(msg)
-            if args.abort_on_error:
-                raise
-            tqdm.write(" - Skipping to next session")
+            return None
+
+        if not is_extracted(session_output_dir):
+            msg = f" - ERROR: extracted outputs missing for session {session_id}."
+            tqdm.write(msg)
+            logging.warning(msg)
+            return None
+
+        # --- 4. Write session metadata ---
+        duration = get_audio_duration(session_output_dir) if not args.skip_audio else None
+        session_metadata = CommitteeMetadata(
+            source_type=source_type,
+            source_id=committee_source_id,
+            source_entry_id=session_id,
+            session_id=session_id,
+            session_date=entry.get("start_date") or None,
+            language="he",
+            duration=duration,
+        )
+        metadata_file = session_output_dir / "metadata.json"
+        with open(metadata_file, "w", encoding="utf-8") as f:
+            f.write(session_metadata.model_dump_json(indent=2))
+
+        tqdm.write(f" - Successfully processed session {session_id}")
+        return session_output_dir
+
+    ready_session_dirs: list[pathlib.Path] = []
+
+    with ThreadPoolExecutor(max_workers=args.download_workers) as executor:
+        future_to_entry = {executor.submit(_process_session, entry): entry for entry in manifest_entries}
+        with tqdm(total=len(manifest_entries), desc="Processing sessions") as pbar:
+            for future in as_completed(future_to_entry):
+                entry = future_to_entry[future]
+                session_id = entry["session_id"]
+                try:
+                    result = future.result()
+                    if result is not None:
+                        ready_session_dirs.append(result)
+                    elif args.abort_on_error:
+                        raise RuntimeError(f"Processing failed for session {session_id}")
+                except Exception as e:
+                    msg = f" - ERROR: Unexpected error processing session {session_id}: {e}"
+                    tqdm.write(msg)
+                    logging.warning(msg)
+                    if args.abort_on_error:
+                        raise
+                    tqdm.write(" - Skipping to next session")
+                finally:
+                    pbar.update(1)
 
     # --- VAD stage (frame-level voice activity detection) ---
     if not args.skip_vad and not args.skip_audio:
