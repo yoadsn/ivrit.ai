@@ -541,10 +541,11 @@ def transcribe_session(session_dir: Path, model, language: str) -> Path:
     ``WhisperResult`` to ``prealign.transcript.json``."""
     out_path = session_dir / PREALIGN_TRANSCRIPT_FILENAME
     audio_path = find_audio(session_dir)
-    result = model.transcribe_stable(
+    result = model.transcribe(
         str(audio_path),
         language=language,
         word_timestamps=True,
+        verbose=None,  # suppress per-session tqdm bar; overall progress shown by caller
     )
     result.save_as_json(str(out_path))
     return out_path
