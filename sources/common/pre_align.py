@@ -249,6 +249,112 @@ REFINE_STRIDE = 3
 STEP_RATIO = 0.5
 BACKTRACK_FRAC = 0.3
 
+# ---------------------------------------------------------------------------
+# Preamble detection
+# ---------------------------------------------------------------------------
+
+# Number of characters taken from the *start* of the accurate text to use as
+# the probe when searching for where in the inaccurate text the real content
+# begins.  Large enough to be distinctive; small enough to stay well within
+# the first topic of discussion.
+_PREAMBLE_PROBE_CHARS = 300
+
+# Coarse stride for the preamble scan (characters in inaccurate text).
+_PREAMBLE_COARSE_STRIDE = 50
+
+# Fine stride for preamble scan around the coarse best position.
+_PREAMBLE_FINE_STRIDE = 5
+
+# Half-width of the fine-search window around the coarse best position.
+_PREAMBLE_FINE_RADIUS = 200
+
+# Minimum cosine similarity for the preamble detection result to be accepted.
+# Below this the inaccurate text is considered too dissimilar at every point
+# and we fall back to inacc_start_offset=0 (no preamble detected).
+_PREAMBLE_MIN_CONFIDENCE = 0.6
+
+
+def detect_preamble_end(
+    accurate_text: str,
+    inaccurate: InaccurateText,
+    probe_chars: int = _PREAMBLE_PROBE_CHARS,
+) -> int:
+    """Return the character offset in *inaccurate.full_text* where the content
+    matching the start of *accurate_text* is first found.
+
+    The audio recording often begins with a spoken preamble (e.g. the
+    chairman's opening remarks, a poem, procedural announcements) that never
+    appears in the written protocol.  Whisper transcribes this preamble, which
+    means the inaccurate text looks like::
+
+        [preamble text]  [text matching protocol]
+
+    while the accurate text is just::
+
+        [text matching protocol]
+
+    If ``prealign_texts`` starts from offset 0 in both texts it tries to match
+    the preamble against the start of the protocol, finds weak accidental
+    matches, and advances the accurate-text search pointer — so when it finally
+    reaches the real discussion in the inaccurate text, the corresponding
+    accurate-text positions have already been "consumed".
+
+    This function slides a TFV probe (the first *probe_chars* characters of the
+    accurate text) across the entire inaccurate text to find the position with
+    the highest cosine similarity.  That position is returned as the suggested
+    start offset for ``prealign_texts``.
+
+    If the best similarity is below :data:`_PREAMBLE_MIN_CONFIDENCE` (e.g. the
+    inaccurate text is garbage throughout) ``0`` is returned so alignment
+    proceeds unchanged.
+    """
+    acc_len = len(accurate_text)
+    inacc_text = inaccurate.full_text
+    inacc_len = len(inacc_text)
+
+    probe_len = min(probe_chars, acc_len, inacc_len)
+    if probe_len == 0:
+        return 0
+
+    probe_tfv = compute_tfv(accurate_text[:probe_len])
+
+    # Coarse sweep across the entire inaccurate text.
+    best_pos = 0
+    best_sim = -1.0
+    pos = 0
+    while pos + probe_len <= inacc_len:
+        sim = cosine_similarity(probe_tfv, compute_tfv(inacc_text[pos : pos + probe_len]))
+        if sim > best_sim:
+            best_sim = sim
+            best_pos = pos
+        pos += _PREAMBLE_COARSE_STRIDE
+
+    # Fine sweep around the coarse best.
+    fine_start = max(0, best_pos - _PREAMBLE_FINE_RADIUS)
+    fine_end = min(inacc_len - probe_len, best_pos + _PREAMBLE_FINE_RADIUS)
+    pos = fine_start
+    while pos <= fine_end:
+        sim = cosine_similarity(probe_tfv, compute_tfv(inacc_text[pos : pos + probe_len]))
+        if sim > best_sim:
+            best_sim = sim
+            best_pos = pos
+        pos += _PREAMBLE_FINE_STRIDE
+
+    if best_sim < _PREAMBLE_MIN_CONFIDENCE:
+        logger.debug(
+            "Preamble detection: best similarity %.3f below threshold %.2f; "
+            "using inacc_start_offset=0.",
+            best_sim, _PREAMBLE_MIN_CONFIDENCE,
+        )
+        return 0
+
+    logger.debug(
+        "Preamble detection: inaccurate text starts matching protocol at "
+        "offset %d (sim=%.3f, probe=%d chars).",
+        best_pos, best_sim, probe_len,
+    )
+    return best_pos
+
 
 @dataclass
 class AnchorPoint:
@@ -346,23 +452,36 @@ def prealign_texts(
     inaccurate: InaccurateText,
     window_size: int = WINDOW_SIZE,
     threshold: float = _MIN_THRESHOLD,
+    inacc_start_offset: int = 0,
 ) -> list[AnchorPoint]:
+    """Align accurate_text against inaccurate.
+
+    Parameters
+    ----------
+    inacc_start_offset:
+        Character offset in *inaccurate.full_text* from which to begin
+        searching.  Set by :func:`detect_preamble_end` to skip any spoken
+        preamble that precedes the actual protocol content.
+    """
     anchors: list[AnchorPoint] = []
     acc_len = len(accurate_text)
     inacc_len = len(inaccurate.full_text)
     if acc_len == 0 or inacc_len == 0:
         return anchors
 
-    w = min(window_size, acc_len, inacc_len)
+    inacc_start_offset = max(0, min(inacc_start_offset, inacc_len - 1))
+    effective_inacc_len = inacc_len - inacc_start_offset
+
+    w = min(window_size, acc_len, effective_inacc_len)
     step = max(1, int(w * STEP_RATIO))
     backtrack = int(w * BACKTRACK_FRAC)
-    ratio = inacc_len / acc_len if acc_len > 0 else 1.0
+    ratio = effective_inacc_len / acc_len if acc_len > 0 else 1.0
 
-    last_inacc_center = 0
+    last_inacc_center = inacc_start_offset
     acc_pos = 0
     while acc_pos + w <= acc_len:
         target_tfv = compute_tfv(accurate_text[acc_pos : acc_pos + w])
-        estimated_inacc_pos = int(acc_pos * ratio)
+        estimated_inacc_pos = inacc_start_offset + int(acc_pos * ratio)
         mono_start = last_inacc_center - backtrack
         prop_start = estimated_inacc_pos - 2 * w
         search_start = min(mono_start, prop_start)
@@ -646,8 +765,12 @@ def prealign_session(
 
     accurate_text = accurate_text_path.read_text(encoding="utf-8")
     inaccurate = load_inaccurate_text_from_stable_ts(trans_path)
+    inacc_start_offset = detect_preamble_end(accurate_text, inaccurate)
     threshold = calibrate_threshold(accurate_text, inaccurate, WINDOW_SIZE)
-    anchors = prealign_texts(accurate_text, inaccurate, threshold=threshold)
+    anchors = prealign_texts(
+        accurate_text, inaccurate, threshold=threshold,
+        inacc_start_offset=inacc_start_offset,
+    )
 
     # Drop non-monotonic anchors rather than plateauing them.
     if anchors:

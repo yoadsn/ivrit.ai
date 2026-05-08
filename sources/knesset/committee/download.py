@@ -456,7 +456,7 @@ def main() -> None:
         print("Running VAD predictions...")
         vad_sessions(
             output_dir,
-            force=args.force_vad or args.force_normalize_reprocess or args.force_pre_align,
+            force=args.force_vad,
             session_ids=args.session_ids,
             abort_on_error=args.abort_on_error,
             pretranscode_workers=args.vad_pretranscode_workers,
