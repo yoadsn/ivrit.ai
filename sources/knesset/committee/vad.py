@@ -26,6 +26,7 @@ import pathlib
 from tqdm import tqdm
 
 from vad.definitions import VAD_SPEECH_PROBS_FILENAME
+from vad.vad_io import clear_vad_worker_dirs
 
 logger = logging.getLogger(__name__)
 
@@ -245,6 +246,8 @@ def vad_sessions(
             tqdm.write(f" - ERROR: {msg}")
             if abort_on_error:
                 raise
+        finally:
+            clear_vad_worker_dirs(str(output_dir))
         return
 
     # ------------------------------------------------------------------
@@ -283,6 +286,8 @@ def vad_sessions(
             msg = f"VAD worker for process PID {p.pid} exited with code {p.exitcode}"
             logger.error(msg)
             errors.append(msg)
+
+    clear_vad_worker_dirs(str(output_dir))
 
     if errors:
         combined = "; ".join(errors)

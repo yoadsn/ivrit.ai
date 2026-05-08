@@ -37,7 +37,7 @@ from sources.knesset.committee.s3 import make_s3_client, s3_download, s3_uri_fil
 from sources.knesset.committee.vad import add_vad_args, vad_sessions
 from utils.audio import get_audio_info
 from vad.definitions import VAD_SPEECH_PROBS_FILENAME
-from vad.vad_io import is_empty_audio
+from vad.vad_io import clear_speech_probs_cache, is_empty_audio
 
 
 def _download_to(
@@ -528,6 +528,11 @@ def main() -> None:
     if not args.skip_manifest:
         print("Generating manifest CSV...")
         build_manifest(str(output_dir))
+
+    # --- Cleanup: remove per-session speech-probs numpy cache files ---
+    for session_dir in output_dir.iterdir():
+        if session_dir.is_dir():
+            clear_speech_probs_cache(str(session_dir))
 
 
 if __name__ == "__main__":
