@@ -6,6 +6,9 @@ COMMITTEE_COLUMNS = [
     "session_id",
     "duration",
     "session_date",
+    "knesset_num",
+    "committee_name",
+    "start_date",
 ]
 
 

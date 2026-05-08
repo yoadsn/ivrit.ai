@@ -207,6 +207,17 @@ def main() -> None:
         action="store_true",
         help="Skip generating the output manifest CSV.",
     )
+    parser.add_argument(
+        "--metadata-manifest-file",
+        type=str,
+        default=None,
+        help=(
+            "Path to a CSV file (e.g. manifest_metadata.csv) whose 'session_id' column "
+            "is used to look up supplemental metadata fields. All columns in this file "
+            "are embedded in each session's metadata.json. If not provided, metadata "
+            "enrichment is skipped."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -249,6 +260,25 @@ def main() -> None:
             )
             return
         manifest_entries = [row for row in reader]
+
+    # Load supplemental metadata keyed by session_id (optional).
+    # All columns from the CSV are stored verbatim; "NULL" and blank values become None.
+    session_metadata_lookup: dict[str, dict] = {}
+    if args.metadata_manifest_file:
+        _meta_path = pathlib.Path(args.metadata_manifest_file)
+        if not _meta_path.exists():
+            print(f"Metadata manifest file '{_meta_path}' does not exist.")
+            return
+        with open(_meta_path, newline="", encoding="utf-8") as _f:
+            _reader = csv.DictReader(_f)
+            for _row in _reader:
+                _sid = _row.get("session_id", "")
+                if _sid:
+                    session_metadata_lookup[_sid] = {
+                        k: v.strip() if (v := (_row.get(k) or "").strip()) and v != "NULL" else None
+                        for k in (_reader.fieldnames or [])
+                        if k != "session_id"
+                    }
 
     if args.session_ids:
         wanted = set(args.session_ids)
@@ -323,6 +353,7 @@ def main() -> None:
 
         # --- 4. Write session metadata ---
         duration = get_audio_duration(session_output_dir) if not args.skip_audio else None
+        _extra = session_metadata_lookup.get(session_id, {})
         session_metadata = CommitteeMetadata(
             source_type=source_type,
             source_id=committee_source_id,
@@ -331,6 +362,7 @@ def main() -> None:
             session_date=entry.get("start_date") or None,
             language="he",
             duration=duration,
+            **_extra,
         )
         metadata_file = session_output_dir / "metadata.json"
         with open(metadata_file, "w", encoding="utf-8") as f:
