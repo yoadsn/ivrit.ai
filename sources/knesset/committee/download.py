@@ -8,7 +8,16 @@ from logging.handlers import RotatingFileHandler
 
 from tqdm import tqdm
 
-from sources.knesset.committee.create_maps import add_create_maps_args, create_maps_sessions
+from sources.common.pre_align import (
+    add_prealign_args,
+)
+from sources.common.pre_align import (
+    pre_align_sessions as _common_pre_align_sessions,
+)
+from sources.knesset.committee.create_maps import (
+    add_create_maps_args,
+    create_maps_sessions,
+)
 from sources.knesset.committee.extraction import is_extracted, process_protocol
 from sources.knesset.committee.manifest import build_manifest
 from sources.knesset.committee.metadata import (
@@ -17,16 +26,18 @@ from sources.knesset.committee.metadata import (
     source_type,
 )
 from sources.knesset.committee.normalize import add_normalize_args, normalize_sessions
-from sources.knesset.committee.refine_segments import add_refine_segments_args, refine_segments_sessions
-from sources.common.pre_align import (
-    add_prealign_args,
-    pre_align_sessions as _common_pre_align_sessions,
+from sources.knesset.committee.refine_segments import (
+    add_refine_segments_args,
+    refine_segments_sessions,
 )
 
 RAW_PROTOCOL_FILENAME = "raw.protocol.txt"
-from sources.knesset.committee.vad import add_vad_args, vad_sessions
+from sources.common.definitions import SKIPPED_FLAG_FILENAME
 from sources.knesset.committee.s3 import make_s3_client, s3_download, s3_uri_filename
+from sources.knesset.committee.vad import add_vad_args, vad_sessions
 from utils.audio import get_audio_info
+from vad.definitions import VAD_SPEECH_PROBS_FILENAME
+from vad.vad_io import is_empty_audio
 
 
 def _download_to(
@@ -91,6 +102,51 @@ def get_audio_duration(session_dir: pathlib.Path) -> float | None:
 
 def _committee_accurate_text_resolver(session_dir: pathlib.Path) -> pathlib.Path:
     return session_dir / RAW_PROTOCOL_FILENAME
+
+
+def _is_empty_audio(session_dir: pathlib.Path) -> bool:
+    """Return True if the VAD output indicates the audio is effectively silent.
+
+    Returns False when no VAD output exists yet or the file cannot be read.
+    """
+    vad_file = session_dir / VAD_SPEECH_PROBS_FILENAME
+    if not vad_file.exists():
+        return False
+    try:
+        return is_empty_audio(str(vad_file))
+    except Exception as exc:
+        logging.warning("Could not read VAD output for %s: %s", session_dir.name, exc)
+        return False
+
+
+def _detect_and_flag_empty_audio_sessions(
+    output_dir: pathlib.Path,
+    session_ids: list[str],
+) -> set[str]:
+    """Inspect VAD output for every session and write ``skipped.flag`` for
+    sessions that contain no meaningful speech.
+
+    Returns the set of session IDs that were flagged so the caller can remove
+    them from any further processing lists.
+    """
+    session_dirs: list[pathlib.Path] = sorted(d for d in output_dir.iterdir() if d.is_dir())
+    if session_ids:
+        wanted = set(session_ids)
+        session_dirs = [d for d in session_dirs if d.name in wanted]
+
+    flagged: set[str] = set()
+    for sd in session_dirs:
+        if not _is_empty_audio(sd):
+            continue
+        flag_file = sd / SKIPPED_FLAG_FILENAME
+        flag_file.touch()
+        flagged.add(sd.name)
+        tqdm.write(f" - Empty audio detected, flagging session: {sd.name}")
+        logging.info("Empty audio session flagged: %s", sd.name)
+
+    if flagged:
+        print(f"Empty audio sessions flagged ({len(flagged)}): {', '.join(sorted(flagged))}")
+    return flagged
 
 
 def pre_align_sessions(session_dirs, **kwargs):
@@ -409,6 +465,12 @@ def main() -> None:
             chunk_size=args.vad_chunk_size,
             devices=args.vad_devices,
         )
+
+        # --- Empty-audio detection (runs right after VAD) ---
+        print("Checking for empty/silent audio sessions...")
+        flagged_ids = _detect_and_flag_empty_audio_sessions(output_dir, args.session_ids)
+        if flagged_ids:
+            ready_session_dirs = [d for d in ready_session_dirs if d.name not in flagged_ids]
 
     # --- Pre-align stage (batch, one worker per device) ---
     if ready_session_dirs and not args.skip_pre_align and not args.skip_audio:

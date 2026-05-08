@@ -32,6 +32,7 @@ import numpy as np
 from stable_whisper import WhisperResult
 from tqdm import tqdm
 
+from sources.common.definitions import SKIPPED_FLAG_FILENAME
 from vad.definitions import SPEECH_PROB_FRAME_DURATION, VAD_SPEECH_PROBS_FILENAME
 from vad.vad_io import load_frame_vad_probs
 
@@ -326,10 +327,12 @@ def refine_segments_sessions(
     # that refine-segments reads from — never modified) and the VAD output.
     # The completion indicator is transcript.refined.json; whether it already
     # exists is checked per-session inside refine_segments_for_session.
+    # Sessions with a skipped.flag are excluded entirely.
     session_dirs = sorted(
         d
         for d in input_folder.iterdir()
         if d.is_dir()
+        and not (d / SKIPPED_FLAG_FILENAME).exists()
         and (d / ALIGNED_TRANSCRIPT_FILENAME).exists()
         and (d / VAD_SPEECH_PROBS_FILENAME).exists()
     )

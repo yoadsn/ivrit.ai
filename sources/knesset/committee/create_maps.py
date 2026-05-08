@@ -38,6 +38,8 @@ from typing import Optional
 
 from tqdm import tqdm
 
+from sources.common.definitions import SKIPPED_FLAG_FILENAME
+
 logger = logging.getLogger(__name__)
 
 RAW_PROTOCOL_FILENAME = "raw.protocol.txt"
@@ -361,7 +363,9 @@ def create_maps_sessions(
 
     session_dirs = sorted(
         d for d in input_folder.iterdir()
-        if d.is_dir() and (d / ALIGNED_TRANSCRIPT_FILENAME).exists()
+        if d.is_dir()
+        and not (d / SKIPPED_FLAG_FILENAME).exists()
+        and (d / ALIGNED_TRANSCRIPT_FILENAME).exists()
     )
 
     if session_ids:

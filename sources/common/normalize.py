@@ -13,6 +13,7 @@ import torch
 from tqdm import tqdm
 
 from sources.common.metadata import NormalizedEntryMetadata
+from sources.common.definitions import SKIPPED_FLAG_FILENAME
 
 # Common constants
 DEFAULT_ALIGN_MODEL = "ivrit-ai/whisper-large-v3-turbo-ct2"
@@ -160,6 +161,9 @@ def normalize_entries(
     if not meta_files:
         print("No entry metadata.json files found in input folder.")
         return
+
+    # Skip sessions that have been flagged (e.g. empty/silent audio).
+    meta_files = [mf for mf in meta_files if not (mf.parent / SKIPPED_FLAG_FILENAME).exists()]
 
     entry_ids = kwargs.pop("entry_ids", None)
     if entry_ids:
