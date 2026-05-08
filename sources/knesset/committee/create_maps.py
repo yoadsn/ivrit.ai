@@ -241,24 +241,26 @@ def _create_map_for_transcript(
     orig_to_norm: list[int],
     spk_segments: list[tuple[int, int, int]],
     force: bool,
-) -> bool:
+) -> tuple[bool, list[str]]:
     """Build one map file from a single transcript (optimised path).
 
-    Returns ``True`` on success (including skip), ``False`` on failure.
+    Returns ``(ok, messages)`` — *ok* is True on success (including skip),
+    False on failure.  *messages* is a list of ``(level, msg)`` strings to
+    be logged by the caller in the parent process.
     """
     session_id = session_dir.name
     transcript_path = session_dir / transcript_filename
     map_path = session_dir / map_filename
+    messages: list[str] = []
 
     if not transcript_path.exists():
-        return True
+        return True, messages
 
     if map_path.exists() and not force:
-        logger.info(
-            "Session %s: %s already exists; skipping.",
-            session_id, map_filename,
+        messages.append(
+            f"INFO: Session {session_id}: {map_filename} already exists; skipping."
         )
-        return True
+        return True, messages
 
     aligned_data = json.loads(transcript_path.read_text(encoding="utf-8"))
     segments = aligned_data.get("segments", [])
@@ -290,10 +292,10 @@ def _create_map_for_transcript(
             new_norm = orig_to_norm[start_char + 1] if start_char + 1 < len(orig_to_norm) else len(norm_text)
             search_from_norm = max(search_from_norm, new_norm)
         else:
-            logger.warning(
-                "Session %s: could not locate segment %d in protocol text "
-                "(transcript=%s, len=%d, text=%.60s...).",
-                session_id, idx, transcript_filename, len(seg_text), seg_text[:60],
+            messages.append(
+                f"WARNING: Session {session_id}: could not locate segment {idx} "
+                f"in protocol text (transcript={transcript_filename}, "
+                f"len={len(seg_text)}, text={seg_text[:60]!s}...)."
             )
             char_spans.append((-1, -1))
             map_entries.append({"start_char": -1, "end_char": -1, "speaker_ids": []})
@@ -310,11 +312,10 @@ def _create_map_for_transcript(
     map_path.write_text(
         json.dumps(map_entries, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    logger.info(
-        "Session %s: wrote %s with %d entries.",
-        session_id, map_filename, len(map_entries),
+    messages.append(
+        f"INFO: Session {session_id}: wrote {map_filename} with {len(map_entries)} entries."
     )
-    return True
+    return True, messages
 
 
 # ---------------------------------------------------------------------------
@@ -325,28 +326,31 @@ def _create_map_for_transcript(
 def create_maps_for_session(
     session_dir: pathlib.Path,
     force: bool = False,
-) -> bool:
+) -> tuple[bool, list[str]]:
     """Create map files for all transcripts present in *session_dir*.
 
     Processes ``transcript.aligned.json`` → ``transcript.aligned.map.json``
     and, if it exists, ``transcript.refined.json`` → ``transcript.refined.map.json``.
 
-    Returns True if all attempted maps succeeded, False otherwise.
+    Returns ``(ok, messages)`` — *ok* is True if all attempted maps succeeded,
+    *messages* is a list of log strings to be emitted by the parent process.
     """
     session_id = session_dir.name
     protocol_path = session_dir / RAW_PROTOCOL_FILENAME
+    messages: list[str] = []
 
     if not protocol_path.exists():
-        logger.warning("Session %s: %s not found; skipping maps.", session_id, RAW_PROTOCOL_FILENAME)
-        return False
+        messages.append(
+            f"WARNING: Session {session_id}: {RAW_PROTOCOL_FILENAME} not found; skipping maps."
+        )
+        return False, messages
 
     # Check that at least the base aligned transcript exists.
     if not (session_dir / ALIGNED_TRANSCRIPT_FILENAME).exists():
-        logger.warning(
-            "Session %s: %s not found; skipping maps.",
-            session_id, ALIGNED_TRANSCRIPT_FILENAME,
+        messages.append(
+            f"WARNING: Session {session_id}: {ALIGNED_TRANSCRIPT_FILENAME} not found; skipping maps."
         )
-        return False
+        return False, messages
 
     protocol_text = protocol_path.read_text(encoding="utf-8")
     spk_segments = _load_speaker_segments(session_dir)
@@ -357,7 +361,7 @@ def create_maps_for_session(
 
     all_ok = True
     for transcript_filename, map_filename in TRANSCRIPT_MAP_PAIRS:
-        ok = _create_map_for_transcript(
+        ok, transcript_msgs = _create_map_for_transcript(
             session_dir,
             transcript_filename,
             map_filename,
@@ -367,10 +371,23 @@ def create_maps_for_session(
             spk_segments,
             force=force,
         )
+        messages.extend(transcript_msgs)
         if not ok:
             all_ok = False
 
-    return all_ok
+    return all_ok, messages
+
+
+def _worker_init() -> None:
+    """Initializer for child processes in the ProcessPoolExecutor.
+
+    Removes file-based handlers inherited from the parent process to avoid
+    multiple processes racing on RotatingFileHandler log rotation.
+    """
+    root = logging.getLogger()
+    for handler in root.handlers[:]:
+        if isinstance(handler, logging.FileHandler):
+            root.removeHandler(handler)
 
 
 # ---------------------------------------------------------------------------
@@ -419,7 +436,7 @@ def create_maps_sessions(
 
     errors: list[Exception] = []
 
-    with ProcessPoolExecutor(max_workers=workers) as executor:
+    with ProcessPoolExecutor(max_workers=workers, initializer=_worker_init) as executor:
         future_to_dir = {
             executor.submit(create_maps_for_session, session_dir, force): session_dir
             for session_dir in session_dirs
@@ -428,7 +445,15 @@ def create_maps_sessions(
             for future in as_completed(future_to_dir):
                 session_dir = future_to_dir[future]
                 try:
-                    ok = future.result()
+                    ok, messages = future.result()
+                    # Re-emit worker messages through the parent's logger.
+                    for msg in messages:
+                        if msg.startswith("WARNING:"):
+                            logger.warning(msg[len("WARNING: "):])
+                        elif msg.startswith("INFO:"):
+                            logger.info(msg[len("INFO: "):])
+                        else:
+                            logger.info(msg)
                     if not ok:
                         tqdm.write(f" - WARNING: map creation skipped/failed for {session_dir.name}")
                         if abort_on_error:
