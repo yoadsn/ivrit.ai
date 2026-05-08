@@ -5,9 +5,9 @@ import numpy as np
 
 from vad.definitions import VAD_SPEECH_PROBS_FILENAME, VAD_SPEECH_PROBS_NP_CACHE_FILENAME
 
-# Sessions whose mean speech probability is below this value are considered
-# to contain no meaningful speech (blank / silent audio).
-EMPTY_AUDIO_SPEECH_PROB_THRESHOLD = 0.2
+# Sessions where ALL frame speech probabilities are below this value are
+# considered to contain no meaningful speech (blank / silent audio).
+EMPTY_AUDIO_SPEECH_PROB_THRESHOLD = 0.005
 
 
 def get_frame_vad_probs_filename(root_dir: str, source: str, episode: str) -> str:
@@ -54,10 +54,10 @@ def clear_speech_probs_cache(session_dir: str) -> None:
 def is_empty_audio(vad_probs_filename: str) -> bool:
     """Return True when the VAD output indicates the audio is effectively silent.
 
-    A session is considered empty when the mean speech probability across all
-    frames is below ``EMPTY_AUDIO_SPEECH_PROB_THRESHOLD``.
+    A session is considered empty only when ALL frame speech probabilities are
+    below ``EMPTY_AUDIO_SPEECH_PROB_THRESHOLD``.
     """
     probs = load_frame_vad_probs(vad_probs_filename)
     if len(probs) == 0:
         return False
-    return float(np.mean(probs)) < EMPTY_AUDIO_SPEECH_PROB_THRESHOLD
+    return bool(np.all(probs < EMPTY_AUDIO_SPEECH_PROB_THRESHOLD))

@@ -33,7 +33,7 @@ import argparse
 import json
 import logging
 import pathlib
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Optional
 
 from tqdm import tqdm
@@ -90,39 +90,21 @@ def _normalize_whitespace(text: str) -> str:
     return " ".join(text.split())
 
 
-def _find_segment_span(
-    protocol_text: str,
-    segment_text: str,
-    search_from: int,
-) -> tuple[int, int] | None:
-    """Find the char span of *segment_text* in *protocol_text* starting from
-    *search_from*, using an overlap / subsequence approach.
+# ---------------------------------------------------------------------------
+# Optimised implementation — pre-builds normalised view once per protocol.
+# ---------------------------------------------------------------------------
 
-    The segment text should appear in the protocol in order.  We normalise
-    whitespace on both sides and do a simple substring search.  If an exact
-    (whitespace-normalised) match is found we map it back to the original
-    protocol char offsets.
 
-    Returns ``(start_char, end_char)`` into *protocol_text*, or ``None``.
+def _build_normalized_protocol(protocol_text: str) -> tuple[str, list[int]]:
+    """Build a whitespace-normalised view of *protocol_text* once.
+
+    Returns ``(norm_text, norm_to_orig)`` where ``norm_to_orig[i]`` is the
+    index into the original *protocol_text* for normalised character ``i``.
     """
-    seg_norm = _normalize_whitespace(segment_text)
-    if not seg_norm:
-        return None
-
-    # Build a whitespace-normalised view of the remaining protocol text,
-    # keeping a mapping from normalised-index -> original-index.
-    #
-    # To avoid re-scanning the entire protocol for every segment, we only
-    # process from ``search_from`` onward (with a small look-back to handle
-    # boundary overlap).
-    look_back = min(search_from, len(seg_norm) + 50)
-    scan_start = search_from - look_back
-
     norm_chars: list[str] = []
     norm_to_orig: list[int] = []
     prev_was_space = True  # suppress leading space
-    for orig_idx in range(scan_start, len(protocol_text)):
-        ch = protocol_text[orig_idx]
+    for orig_idx, ch in enumerate(protocol_text):
         if ch in (" ", "\t", "\n", "\r"):
             if not prev_was_space and norm_chars:
                 norm_chars.append(" ")
@@ -133,20 +115,36 @@ def _find_segment_span(
             norm_to_orig.append(orig_idx)
             prev_was_space = False
 
-    norm_view = "".join(norm_chars)
+    return "".join(norm_chars), norm_to_orig
 
-    # Find the segment in the normalised view.
-    pos = norm_view.find(seg_norm)
+
+def _find_segment_span(
+    norm_text: str,
+    norm_to_orig: list[int],
+    segment_text: str,
+    search_from_norm: int,
+) -> tuple[int, int, int] | None:
+    """Find the char span of *segment_text* using the pre-built normalised view.
+
+    *search_from_norm* is the offset into *norm_text* to start searching from.
+
+    Returns ``(start_orig, end_orig, end_norm_idx + 1)`` — the original char
+    span plus the normalised position just past the match (to advance the
+    caller's cursor), or ``None``.
+    """
+    seg_norm = _normalize_whitespace(segment_text)
+    if not seg_norm:
+        return None
+
+    pos = norm_text.find(seg_norm, search_from_norm)
     if pos < 0:
         return None
 
-    # Map back to original indices.
     start_orig = norm_to_orig[pos]
-    # end_orig: the original index just past the last matched char.
     end_norm_idx = pos + len(seg_norm) - 1
     end_orig = norm_to_orig[end_norm_idx] + 1
 
-    return start_orig, end_orig
+    return start_orig, end_orig, pos + 1
 
 
 # ---------------------------------------------------------------------------
@@ -209,15 +207,42 @@ def _assign_speakers(
 # ---------------------------------------------------------------------------
 
 
+def _build_orig_to_norm(norm_to_orig: list[int], protocol_len: int) -> list[int]:
+    """Build a reverse mapping: original-index -> normalised-index.
+
+    For original positions that don't map directly to a normalised character
+    (i.e. whitespace that was collapsed), we map to the *next* valid
+    normalised position so that ``search_from`` in original space translates
+    to a safe (possibly slightly early) position in normalised space.
+    """
+    orig_to_norm = [len(norm_to_orig)] * protocol_len  # default: past end
+    for norm_idx, orig_idx in enumerate(norm_to_orig):
+        # Only store the first norm_idx that maps to each orig_idx.
+        if orig_to_norm[orig_idx] > norm_idx:
+            orig_to_norm[orig_idx] = norm_idx
+    # Fill gaps: for positions not directly in the mapping (collapsed
+    # whitespace), propagate backward so they point to the next valid
+    # normalised position.
+    next_norm = len(norm_to_orig)
+    for i in range(protocol_len - 1, -1, -1):
+        if orig_to_norm[i] <= next_norm:
+            next_norm = orig_to_norm[i]
+        else:
+            orig_to_norm[i] = next_norm
+    return orig_to_norm
+
+
 def _create_map_for_transcript(
     session_dir: pathlib.Path,
     transcript_filename: str,
     map_filename: str,
-    protocol_text: str,
+    norm_text: str,
+    norm_to_orig: list[int],
+    orig_to_norm: list[int],
     spk_segments: list[tuple[int, int, int]],
     force: bool,
 ) -> bool:
-    """Build one map file from a single transcript.
+    """Build one map file from a single transcript (optimised path).
 
     Returns ``True`` on success (including skip), ``False`` on failure.
     """
@@ -226,7 +251,6 @@ def _create_map_for_transcript(
     map_path = session_dir / map_filename
 
     if not transcript_path.exists():
-        # Not present — nothing to do (not an error).
         return True
 
     if map_path.exists() and not force:
@@ -239,29 +263,38 @@ def _create_map_for_transcript(
     aligned_data = json.loads(transcript_path.read_text(encoding="utf-8"))
     segments = aligned_data.get("segments", [])
 
-    # Sequential sweep: find each segment's text in the protocol.
-    search_from = 0
+    # Sequential sweep using pre-built normalised view.
+    search_from_norm = 0
     char_spans: list[tuple[int, int]] = []
     map_entries: list[dict] = []
 
     for idx, seg in enumerate(segments):
         seg_text = seg.get("text", "")
-        span = _find_segment_span(protocol_text, seg_text, search_from)
+        # Apply the same look-back as the old code: the old code used
+        # look_back = min(search_from, len(seg_norm) + 50) in original space.
+        # We replicate this by backing up in normalised space.
+        seg_norm = _normalize_whitespace(seg_text)
+        look_back = min(search_from_norm, len(seg_norm) + 50)
+        effective_from = search_from_norm - look_back
+
+        span = _find_segment_span(
+            norm_text, norm_to_orig, seg_text, effective_from,
+        )
         if span is not None:
-            start_char, end_char = span
+            start_char, end_char, next_norm_pos = span
             char_spans.append((start_char, end_char))
             map_entries.append({"start_char": start_char, "end_char": end_char, "speaker_ids": []})
-            # Advance search_from to just past this match to maintain
-            # sequential order, but allow a little overlap for boundary
-            # fuzziness.
-            search_from = max(search_from, start_char + 1)
+            # Advance: replicate old behaviour of
+            # search_from = max(search_from, start_char + 1)
+            # but in normalised space.
+            new_norm = orig_to_norm[start_char + 1] if start_char + 1 < len(orig_to_norm) else len(norm_text)
+            search_from_norm = max(search_from_norm, new_norm)
         else:
             logger.warning(
                 "Session %s: could not locate segment %d in protocol text "
                 "(transcript=%s, len=%d, text=%.60s...).",
                 session_id, idx, transcript_filename, len(seg_text), seg_text[:60],
             )
-            # Insert a placeholder with -1 to signal unmapped.
             char_spans.append((-1, -1))
             map_entries.append({"start_char": -1, "end_char": -1, "speaker_ids": []})
 
@@ -318,13 +351,19 @@ def create_maps_for_session(
     protocol_text = protocol_path.read_text(encoding="utf-8")
     spk_segments = _load_speaker_segments(session_dir)
 
+    # Pre-build normalised protocol view once for the session.
+    norm_text, norm_to_orig = _build_normalized_protocol(protocol_text)
+    orig_to_norm = _build_orig_to_norm(norm_to_orig, len(protocol_text))
+
     all_ok = True
     for transcript_filename, map_filename in TRANSCRIPT_MAP_PAIRS:
         ok = _create_map_for_transcript(
             session_dir,
             transcript_filename,
             map_filename,
-            protocol_text,
+            norm_text,
+            norm_to_orig,
+            orig_to_norm,
             spk_segments,
             force=force,
         )
@@ -355,7 +394,7 @@ def create_maps_sessions(
     Parameters
     ----------
     workers:
-        Number of parallel threads to use for processing sessions.
+        Number of parallel processes to use for processing sessions.
     """
     if not input_folder.is_dir():
         logger.warning("Input folder %s does not exist.", input_folder)
@@ -380,7 +419,7 @@ def create_maps_sessions(
 
     errors: list[Exception] = []
 
-    with ThreadPoolExecutor(max_workers=workers) as executor:
+    with ProcessPoolExecutor(max_workers=workers) as executor:
         future_to_dir = {
             executor.submit(create_maps_for_session, session_dir, force): session_dir
             for session_dir in session_dirs
