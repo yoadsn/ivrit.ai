@@ -435,6 +435,19 @@ _BOUNDARY_CHARS_PRIMARY = set(".\n?!")
 _BOUNDARY_CHARS_SECONDARY = set(",;:")
 _MIN_SEGMENT_CHARS = 20
 
+# Minimum number of anchors required per this many characters of accurate text.
+# Below this density the alignment is considered unreliable and the entire
+# accurate text is emitted as a single zero-duration segment rather than being
+# split on degenerate boundaries.
+_MIN_ANCHORS_PER_CHARS = 1000
+
+# Acceptable ratio of inaccurate-text length to accurate-text length.
+# Outside [_MIN_LENGTH_RATIO, _MAX_LENGTH_RATIO] the inaccurate transcription
+# is structurally incompatible with the accurate text (e.g. pure hallucination
+# or wholesale silence) and alignment is skipped immediately.
+_MIN_LENGTH_RATIO = 0.5
+_MAX_LENGTH_RATIO = 2.0
+
 
 @dataclass
 class TextSegment:
@@ -466,11 +479,69 @@ def _find_nearest_boundary(text: str, target: int, radius: int = _SNAP_RADIUS) -
     return best_primary if best_primary is not None else best_secondary
 
 
+def _anchors_sufficient(accurate_text: str, anchors: list[AnchorPoint]) -> bool:
+    """Return True when anchor density meets the minimum requirement.
+
+    Requires at least one anchor per :data:`_MIN_ANCHORS_PER_CHARS` characters
+    of accurate text.  Below this density the alignment is too coarse to
+    produce meaningful segment boundaries.
+    """
+    acc_len = len(accurate_text)
+    if acc_len == 0:
+        return True
+    required = max(1, acc_len // _MIN_ANCHORS_PER_CHARS)
+    return len(anchors) >= required
+
+
+def _single_segment_fallback(
+    accurate_text: str,
+    anchors: list[AnchorPoint],
+) -> list[TextSegment]:
+    """Emit the entire accurate text as one segment.
+
+    Used when anchor density is too low to trust boundary placement.  The
+    timestamp is taken from the first anchor when available, otherwise 0.0.
+    """
+    if not accurate_text.strip():
+        return []
+    ts = anchors[0].timestamp_s if anchors else 0.0
+    return [TextSegment(0, len(accurate_text), ts, ts, accurate_text)]
+
+
 def segment_text(
     accurate_text: str,
     anchors: list[AnchorPoint],
     trans_json_path: Path,
+    inaccurate: Optional["InaccurateText"] = None,
 ) -> list[TextSegment]:
+    # Guard 1: length-ratio sanity check.  If the inaccurate text is wildly
+    # shorter or longer than the accurate text the transcription is structurally
+    # incompatible and alignment is hopeless regardless of anchor count.
+    if inaccurate is not None:
+        acc_len = len(accurate_text)
+        inacc_len = len(inaccurate.full_text)
+        if acc_len > 0:
+            ratio = inacc_len / acc_len
+            if not (_MIN_LENGTH_RATIO <= ratio <= _MAX_LENGTH_RATIO):
+                logger.warning(
+                    "Inaccurate/accurate text length ratio %.3f is outside "
+                    "[%.1f, %.1f]; emitting entire accurate text as a single segment.",
+                    ratio, _MIN_LENGTH_RATIO, _MAX_LENGTH_RATIO,
+                )
+                return _single_segment_fallback(accurate_text, anchors)
+
+    # Guard 2: if we don't have enough anchors to reliably place boundaries,
+    # emit the whole text as one segment rather than splitting at spurious
+    # positions (which would duplicate content across segments).
+    if not _anchors_sufficient(accurate_text, anchors):
+        logger.warning(
+            "Anchor density too low (%d anchor(s) for %d chars); "
+            "emitting entire accurate text as a single segment.",
+            len(anchors),
+            len(accurate_text),
+        )
+        return _single_segment_fallback(accurate_text, anchors)
+
     data = json.loads(trans_json_path.read_text(encoding="utf-8"))
     whisper_segs = data.get("segments", [])
 
@@ -586,7 +657,7 @@ def prealign_session(
                 clean.append(a)
         anchors = clean
 
-    segments = segment_text(accurate_text, anchors, trans_path)
+    segments = segment_text(accurate_text, anchors, trans_path, inaccurate=inaccurate)
 
     # Serialize via stable_whisper so transcript.json is a canonical
     # WhisperResult dump with only standard fields.
