@@ -174,6 +174,148 @@ def _fix_alignment_text_integrity(result: stable_whisper.WhisperResult, text_fed
                                f"+ trimmed {remaining_trim} chars from partial word at boundary.")
 
 
+def _remove_cross_call_text_overlap(
+    committed_pieces: list[stable_whisper.result.Segment],
+    new_segments: list[stable_whisper.result.Segment],
+) -> list[stable_whisper.result.Segment]:
+    """Remove text overlap between the tail of already-committed pieces and the
+    head of newly-produced segments from a different alignment call.
+
+    When the main alignment pass produces a zero-duration tail (alignment ran out
+    of audio) and the subsequent confusion-zone skip pass starts with text that
+    overlaps that tail, the same text appears twice.  For example:
+
+        committed tail:  "...העבודה עצמה תתחבר ותשתנה."   (zero-duration)
+        new head:        " ותשתנה. איפה אפשר לשנות? ..."  (zero-duration)
+
+    This function detects such overlaps and removes the duplicate words from the
+    start of *new_segments*, returning the (possibly trimmed) list.
+
+    Only removes overlap when:
+    - The tail of committed_pieces contains zero-duration words
+    - The head of new_segments contains zero-duration words
+    - There is a textual suffix/prefix overlap between them
+    """
+    if not committed_pieces or not new_segments:
+        return new_segments
+
+    # Collect zero-duration words from the tail of committed_pieces
+    tail_zero_words = []
+    for seg in reversed(committed_pieces):
+        if not seg.words:
+            continue
+        for w in reversed(seg.words):
+            if w.start == w.end:
+                tail_zero_words.append(w)
+            else:
+                break  # Hit a real-duration word, stop
+        if tail_zero_words and seg.words and seg.words[0].start != seg.words[0].end:
+            break  # This segment had a mix; we've collected the zero-duration tail
+        if not tail_zero_words:
+            # No zero-duration words at all in the last segment — no overlap possible
+            return new_segments
+    tail_zero_words.reverse()
+
+    if not tail_zero_words:
+        return new_segments
+
+    tail_text = ''.join(w.word for w in tail_zero_words)
+
+    # Collect zero-duration words from the head of new_segments
+    head_zero_words = []
+    for seg in new_segments:
+        if not seg.words:
+            continue
+        for w in seg.words:
+            if w.start == w.end:
+                head_zero_words.append(w)
+            else:
+                break  # Hit a real-duration word, stop
+        if head_zero_words and seg.words and seg.words[-1].start != seg.words[-1].end:
+            continue  # Entire segment was zero-duration, check next
+        break
+
+    if not head_zero_words:
+        return new_segments
+
+    head_text = ''.join(w.word for w in head_zero_words)
+
+    # Find overlap: suffix of tail_text that matches prefix of head_text
+    overlap_len = 0
+    max_check = min(len(tail_text), len(head_text))
+    for length in range(1, max_check + 1):
+        if head_text[:length] == tail_text[-length:]:
+            overlap_len = length
+
+    if overlap_len == 0:
+        return new_segments
+
+    # Remove exactly overlap_len characters worth of words from the head of new_segments
+    chars_to_remove = overlap_len
+    chars_removed = 0
+    words_removed = 0
+
+    for w in head_zero_words:
+        word_len = len(w.word)
+        if chars_removed + word_len <= chars_to_remove:
+            chars_removed += word_len
+            words_removed += 1
+        else:
+            break
+
+    if chars_removed == chars_to_remove:
+        # Clean word-boundary removal — drop these words from their segments
+        removed = 0
+        for seg in new_segments:
+            if not seg.words or removed >= words_removed:
+                break
+            new_words = []
+            for w in seg.words:
+                if removed < words_removed and w.start == w.end:
+                    removed += 1
+                    continue
+                new_words.append(w)
+            seg.words = new_words
+
+        # Remove empty segments
+        new_segments = [s for s in new_segments if s.words]
+
+        logger.warning(
+            f"_remove_cross_call_text_overlap: removed {words_removed} duplicate "
+            f"words ({chars_removed} chars) at cross-call boundary."
+        )
+    elif chars_removed < chars_to_remove:
+        # Partial word overlap — trim the text of the next word
+        remaining_trim = chars_to_remove - chars_removed
+        next_word = head_zero_words[words_removed] if words_removed < len(head_zero_words) else None
+        if next_word and next_word.word[:remaining_trim] == tail_text[-remaining_trim:]:
+            # Remove whole words first
+            removed = 0
+            for seg in new_segments:
+                if not seg.words or removed >= words_removed:
+                    break
+                new_words = []
+                for w in seg.words:
+                    if removed < words_removed and w.start == w.end:
+                        removed += 1
+                        continue
+                    new_words.append(w)
+                seg.words = new_words
+
+            # Trim the partial word
+            next_word.word = next_word.word[remaining_trim:]
+
+            # Remove empty segments
+            new_segments = [s for s in new_segments if s.words]
+
+            logger.warning(
+                f"_remove_cross_call_text_overlap: removed {words_removed} words "
+                f"+ trimmed {remaining_trim} chars from partial word at cross-call boundary."
+            )
+
+    return new_segments
+
+
 def align_transcript_to_audio(
     audio_file: Path,
     transcript: Union[Path, stable_whisper.result.WhisperResult],
@@ -566,7 +708,10 @@ def align_transcript_to_audio(
                     # Start cannot be above the end
                     word.start = min(word.end, word.start)
 
-            aligned_pieces.extend(aligned_skipped.segments)  # consider this done (although it's unaligned == estimated)
+            # Remove text that may have been duplicated across the main alignment
+            # pass (zero-duration tail) and this skip pass (zero-duration head).
+            deduped_skipped = _remove_cross_call_text_overlap(aligned_pieces, aligned_skipped.segments)
+            aligned_pieces.extend(deduped_skipped)  # consider this done (although it's unaligned == estimated)
 
             # Mark the top text we took from the unaligned - so we cannot match earlier than that
             # on next iterations
