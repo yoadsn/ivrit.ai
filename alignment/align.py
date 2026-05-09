@@ -396,12 +396,25 @@ def align_transcript_to_audio(
 
         # Prepare for next align attempt
         if not done:
-            to_align_next = get_text_from_segments(segments_after_assumed_confusion_zone)
+            if not segments_around_confusion_zone and probable_segment_before_confusion_zone is not None:
+                # Edge case: the skip logic found no unaligned segments
+                # overlapping the confusion zone (e.g. the alignment ran
+                # against a long pre-roll of wrong audio), but we already
+                # committed segments at the probable-segment path above.
+                # Keep to_align_next as set at line 180 (the text after the
+                # probable segment) to avoid re-including text that was
+                # already committed to aligned_pieces.  We only need to
+                # fix slice_start to point to the correct audio position
+                # for that text — use the first unaligned segment that
+                # starts after the confusion zone.
+                slice_start = first_segment_to_continue_aligning.start
+            else:
+                to_align_next = get_text_from_segments(segments_after_assumed_confusion_zone)
 
-            # next audio start is the confusion zone end or the start of the
-            # first segment to align - which ever comes first
-            # slice_start = min(max_confusion_zone_end, first_segment_to_continue_aligning.start)
-            slice_start = first_segment_to_continue_aligning.start
+                # next audio start is the confusion zone end or the start of the
+                # first segment to align - which ever comes first
+                # slice_start = min(max_confusion_zone_end, first_segment_to_continue_aligning.start)
+                slice_start = first_segment_to_continue_aligning.start
 
             # Update progress bar
             progress_bar.update(slice_start - progress_bar.n)
