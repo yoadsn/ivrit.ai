@@ -514,10 +514,6 @@ def align_transcript_to_audio(
         )
 
         progress_bar.write(f"Skipping confusion zone: {min_confusion_zone_start} - {max_confusion_zone_end}")
-        logger.warning(f"[SKIP-TRACE] === Entering confusion zone skip ===")
-        logger.warning(f"[SKIP-TRACE] min_confusion_zone_start={min_confusion_zone_start}, max_confusion_zone_end={max_confusion_zone_end}")
-        logger.warning(f"[SKIP-TRACE] aligned_pieces count={len(aligned_pieces)}, total text in pieces={sum(len(s.text) for s in aligned_pieces)}")
-        logger.warning(f"[SKIP-TRACE] to_align_next length={len(to_align_next)}, first 80 chars: {to_align_next[:80]!r}")
         # skipping - resets the jump back strategy allowed tries
         current_pre_confusion_zone_tries = 0
 
@@ -563,12 +559,6 @@ def align_transcript_to_audio(
 
             # where can we find the prefix text ?
             found_at_text_idx = text_around_confusion_zone.find(text_at_start_of_confusion_zone)
-            logger.warning(f"[SKIP-TRACE] text search: search_radius={search_radius_to_try}, "
-                           f"segments_around count={len(segments_around_confusion_zone)}, "
-                           f"text_around len={len(text_around_confusion_zone)}, "
-                           f"search_prefix len={len(text_at_start_of_confusion_zone)}, "
-                           f"search_prefix={text_at_start_of_confusion_zone[:60]!r}, "
-                           f"found_at_text_idx={found_at_text_idx}")
 
             # prepare for next try or break
             if found_at_text_idx == -1:
@@ -592,15 +582,12 @@ def align_transcript_to_audio(
             )
             text_around_confusion_zone = get_text_from_segments(segments_around_confusion_zone)
             found_at_text_idx = text_around_confusion_zone.find(text_at_start_of_confusion_zone)
-            logger.warning(f"[SKIP-TRACE] full unaligned search: segments={len(segments_around_confusion_zone)}, "
-                           f"text_len={len(text_around_confusion_zone)}, found_at_text_idx={found_at_text_idx}")
 
         # If STILL cannot find - genuine data corruption.
         if found_at_text_idx == -1:
             progress_bar.write(
                 f"Could not find matching text in {entry_id or 'entry'} confusion zone, slice_start: {slice_start} - hard skip (+corruption) expected"
             )
-            logger.warning(f"[SKIP-TRACE] HARD SKIP: could not find text, defaulting found_at_text_idx=0")
             found_at_text_idx = 0
 
         # Recall the latest known aligned timestamp - upcoming segments cannot
@@ -613,10 +600,6 @@ def align_transcript_to_audio(
         segments_after_assumed_confusion_zone = unaligned.get_content_by_time(
             (max_confusion_zone_end, unaligned.segments[-1].end), segment_level=True
         )
-        logger.warning(f"[SKIP-TRACE] segments_after_assumed_confusion_zone: count={len(segments_after_assumed_confusion_zone)}, "
-                       f"first_id={segments_after_assumed_confusion_zone[0].id if segments_after_assumed_confusion_zone else None}, "
-                       f"first_start={segments_after_assumed_confusion_zone[0].start if segments_after_assumed_confusion_zone else None}, "
-                       f"text_len={sum(len(s.text) for s in segments_after_assumed_confusion_zone)}")
 
         # Ensure the segments we will align next start after the max_confusion_zone_end
         # so the skip will be effective.
@@ -630,8 +613,6 @@ def align_transcript_to_audio(
         # and the index of the text within that segment
         curr_matched_segment_idx = 0
         index_within_segment = found_at_text_idx
-        logger.warning(f"[SKIP-TRACE] found_at_text_idx={found_at_text_idx}, "
-                       f"segments_around count={len(segments_around_confusion_zone) if segments_around_confusion_zone else 0}")
 
         # if any segments found covering the confusion zone - analyze them to figure
         # out what exactly is to be skipped or already aligned
@@ -645,11 +626,6 @@ def align_transcript_to_audio(
             # get the initial segment
             initial_unaligned_segment_in_confusion_zone = segments_around_confusion_zone[curr_matched_segment_idx]
             initial_unaligned_segment_id_in_confusion_zone = initial_unaligned_segment_in_confusion_zone.id
-            logger.warning(f"[SKIP-TRACE] initial_unaligned_segment_id={initial_unaligned_segment_id_in_confusion_zone}, "
-                           f"index_within_segment={index_within_segment}, "
-                           f"segment text len={len(initial_unaligned_segment_in_confusion_zone.text)}, "
-                           f"segment start={initial_unaligned_segment_in_confusion_zone.start}, "
-                           f"segment end={initial_unaligned_segment_in_confusion_zone.end}")
 
             # and if the text is mid-point within the segment. we need only the matched part.
             if index_within_segment > 0:
@@ -705,17 +681,6 @@ def align_transcript_to_audio(
             # this would not create high quality alignment probably - but will produce (arbitrary) word timings
             # that allow those segments to co-exist with the properly aligned segments.
             skipped_text_to_align = get_text_from_segments(confusing_segments_to_skip)
-            logger.warning(f"[SKIP-TRACE] confusing_segments_to_skip: count={len(confusing_segments_to_skip)}, "
-                           f"text_len={len(skipped_text_to_align)}, "
-                           f"first_id={confusing_segments_to_skip[0].id if hasattr(confusing_segments_to_skip[0], 'id') else 'synth'}, "
-                           f"last_id={confusing_segments_to_skip[-1].id if hasattr(confusing_segments_to_skip[-1], 'id') else 'synth'}, "
-                           f"first_segment_to_continue_id={first_segment_to_continue_aligning.id if first_segment_to_continue_aligning else None}")
-            # Log the text gap: text committed so far + skipped text + text to continue should == total
-            _committed_so_far = sum(len(s.text) for s in aligned_pieces)
-            _continue_text_len = sum(len(s.text) for s in segments_after_assumed_confusion_zone) if segments_after_assumed_confusion_zone else 0
-            _total_accounted = _committed_so_far + len(skipped_text_to_align) + _continue_text_len
-            _original_len = len(get_text_from_segments(unaligned.segments))
-            logger.warning(f"[SKIP-TRACE] TEXT ACCOUNTING: committed={_committed_so_far} + skipped={len(skipped_text_to_align)} + continue={_continue_text_len} = {_total_accounted} vs original={_original_len} (gap={_original_len - _total_accounted})")
             align_skipped_start_from = max(top_aligned_timestamp, confusing_segments_to_skip[0].start)
             align_skipped_end_at = (
                 first_segment_to_continue_aligning.start if first_segment_to_continue_aligning else None
@@ -748,11 +713,6 @@ def align_transcript_to_audio(
             # Remove text that may have been duplicated across the main alignment
             # pass (zero-duration tail) and this skip pass (zero-duration head).
             deduped_skipped = _remove_cross_call_text_overlap(aligned_pieces, aligned_skipped.segments)
-            _skipped_before_dedup = sum(len(s.text) for s in aligned_skipped.segments)
-            _skipped_after_dedup = sum(len(s.text) for s in deduped_skipped)
-            if _skipped_before_dedup != _skipped_after_dedup:
-                logger.warning(f"[SKIP-TRACE] cross-call dedup removed {_skipped_before_dedup - _skipped_after_dedup} chars "
-                               f"(before={_skipped_before_dedup}, after={_skipped_after_dedup})")
             aligned_pieces.extend(deduped_skipped)  # consider this done (although it's unaligned == estimated)
 
             # Mark the top text we took from the unaligned - so we cannot match earlier than that
@@ -779,17 +739,11 @@ def align_transcript_to_audio(
                 s for s in segments_after_assumed_confusion_zone if s.id > last_skipped_original_id
             ]
             if len(segments_after_assumed_confusion_zone) != prev_after_count:
-                logger.warning(f"[SKIP-TRACE] overlap filter removed {prev_after_count - len(segments_after_assumed_confusion_zone)} segments from segments_after "
-                               f"(last_skipped_original_id={last_skipped_original_id})")
                 if not segments_after_assumed_confusion_zone:
                     done = True
                     first_segment_to_continue_aligning = None
                 else:
                     first_segment_to_continue_aligning = segments_after_assumed_confusion_zone[0]
-
-        logger.warning(f"[SKIP-TRACE] === End of skip logic: done={done}, "
-                       f"aligned_pieces count={len(aligned_pieces)}, "
-                       f"total text in pieces={sum(len(s.text) for s in aligned_pieces)}")
 
         # Prepare for next align attempt
         if not done:
@@ -807,9 +761,6 @@ def align_transcript_to_audio(
                 slice_start = first_segment_to_continue_aligning.start
             else:
                 to_align_next = get_text_from_segments(segments_after_assumed_confusion_zone)
-                logger.warning(f"[SKIP-TRACE] to_align_next set from segments_after: len={len(to_align_next)}, "
-                               f"first 80={to_align_next[:80]!r}, "
-                               f"slice_start will be={first_segment_to_continue_aligning.start}")
 
                 # next audio start is the confusion zone end or the start of the
                 # first segment to align - which ever comes first
