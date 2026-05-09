@@ -240,7 +240,7 @@ def parse_document_xml(source):
     clean_parts: list[str] = []
     clean_pos = 0
     first_speaker_seen = False
-    # "A separator \n is needed before the next content paragraph."  This
+    # "A separator space is needed before the next content paragraph."  This
     # collapses any number of skipped / empty paragraphs.
     clean_needs_sep = False
 
@@ -351,7 +351,7 @@ def parse_document_xml(source):
                 ts_map.append((ts_ms, clean_pos))
         elif first_speaker_seen and p_clean_len > 0:
             if clean_needs_sep:
-                clean_parts.append("\n")
+                clean_parts.append(" ")
                 clean_pos += 1
             para_start = clean_pos
             for chunk in p_clean:
