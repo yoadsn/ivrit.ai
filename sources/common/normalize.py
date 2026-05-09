@@ -1,7 +1,9 @@
 import argparse
+import datetime
 import logging
 import pathlib
 import sys
+import time
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from queue import Queue
@@ -12,8 +14,10 @@ import stable_whisper
 import torch
 from tqdm import tqdm
 
-from sources.common.metadata import NormalizedEntryMetadata
 from sources.common.definitions import SKIPPED_FLAG_FILENAME
+from sources.common.metadata import NormalizedEntryMetadata
+
+logger = logging.getLogger(__name__)
 
 # Common constants
 DEFAULT_ALIGN_MODEL = "ivrit-ai/whisper-large-v3-turbo-ct2"
@@ -207,6 +211,7 @@ def normalize_entries(
     try:
         # Create a thread pool with as many workers as there are devices
         total_done = 0
+        start_time = time.time()
         with ThreadPoolExecutor(max_workers=num_workers) as executor:
             # Process entries in parallel using threads
             futures = [executor.submit(process_entry, meta_file.parent) for meta_file in meta_files]
@@ -215,7 +220,13 @@ def normalize_entries(
                 try:
                     future.result()
                     total_done += 1
-                    logging.info(f"done/total: {total_done}/{len(futures)} ({total_done * 100/len(futures):.2f}% done)")
+                    run_duration_so_far = time.time() - start_time
+                    avg_duration_per_done = run_duration_so_far / total_done
+                    remaining_time = (len(futures) - total_done) * avg_duration_per_done
+                    remaining_time_str = str(datetime.timedelta(seconds=round(remaining_time)))
+                    logger.info(
+                        f"Normalization done/total: {total_done}/{len(futures)} ({total_done * 100/len(futures):.2f}% done) | Est. Remaining time: {remaining_time_str}"
+                    )
                 except Exception as e:
                     # The processor is responsilbe to catch and suppress if skipping
                     # after error is required. Here, the runner assumes any raised
