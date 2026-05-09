@@ -216,7 +216,7 @@ def normalize_sessions(
     force_normalize_reprocess: bool = False,
     force_rescore: bool = False,
     failure_threshold: float = DEFAULT_FAILURE_THRESHOLD,
-    plenum_ids: Optional[List[str]] = None,
+    session_ids: Optional[List[str]] = None,
     abort_on_error: bool = False,
 ) -> None:
     """
@@ -229,11 +229,11 @@ def normalize_sessions(
         force_normalize_reprocess: Whether to force reprocessing even if aligned transcript exists
         force_rescore: Whether to force recalculation of quality score
         failure_threshold: Threshold for alignment failure
-        plenum_ids: Optional list of plenum IDs to process (if None, process all)
+        session_ids: Optional list of session IDs to process (if None, process all)
         abort_on_err: If specified will crash on error instead of skipping that entry
     """
 
-    # Normalize plenums
+    # Normalize session
     normalize_entries(
         input_folder=input_folder,
         align_devices=align_devices,
@@ -243,7 +243,7 @@ def normalize_sessions(
         failure_threshold=failure_threshold,
         force_reprocess=force_normalize_reprocess,
         force_rescore=force_rescore,
-        entry_ids=plenum_ids,
+        entry_ids=session_ids,
         abort_on_error=abort_on_error,
     )
 

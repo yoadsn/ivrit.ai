@@ -31,7 +31,7 @@ import multiprocessing as mp
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Optional
 
 import numpy as np
 from tqdm import tqdm
@@ -932,8 +932,9 @@ def _worker_main(
 
 
 def pre_align_sessions(
-    session_dirs: Iterable[Path],
+    output_dir: Path,
     accurate_text_resolver,
+    session_ids: list[str],
     devices: str = DEFAULT_PRE_ALIGN_DEVICES,
     model_name: str = DEFAULT_PRE_ALIGN_MODEL,
     compute_type: str = DEFAULT_COMPUTE_TYPE,
@@ -946,13 +947,19 @@ def pre_align_sessions(
     One worker process is spawned per device parsed from the comma-separated
     ``devices`` string.  Workers share a queue of session directory paths.
 
+    Discovers session directories under *output_dir*, filters by
+    *session_ids*, and skips sessions that lack required artifacts
+    (audio file and accurate text as resolved by *accurate_text_resolver*).
+
     Parameters
     ----------
-    session_dirs:
-        Session directories to process.
+    output_dir:
+        Root directory that contains one sub-folder per session.
     accurate_text_resolver:
         A callable ``(session_dir: Path) -> Path`` that returns the path to
         the accurate plain-text transcript for that session directory.
+    session_ids:
+        Restrict processing to these session IDs.
     devices:
         Comma-separated device list (e.g. ``"cuda:0,cuda:1"``).
     model_name:
@@ -975,15 +982,29 @@ def pre_align_sessions(
     if not device_list:
         raise ValueError("pre_align_sessions requires at least one device.")
 
-    all_dirs = [Path(d) for d in session_dirs]
+    # Discover session dirs, filter by session_ids, check artifacts.
+    wanted = set(session_ids)
+    all_dirs: list[Path] = sorted(
+        d for d in output_dir.iterdir()
+        if d.is_dir() and d.name in wanted
+    )
+
     results: dict[str, tuple[bool, Optional[str]]] = {}
     pending: list[Path] = []
     for d in all_dirs:
         if not force and is_pre_aligned(d):
             logger.info("Session %s already pre-aligned; skipping.", d.name)
             results[str(d)] = (True, None)
-        else:
-            pending.append(d)
+            continue
+        audio = next(d.glob("audio.*"), None)
+        if audio is None:
+            logger.info("Pre-align: skipping %s (no audio file).", d.name)
+            continue
+        accurate_text_path = accurate_text_resolver(d)
+        if not accurate_text_path.exists():
+            logger.info("Pre-align: skipping %s (no accurate text: %s).", d.name, accurate_text_path.name)
+            continue
+        pending.append(d)
 
     if not pending:
         logger.info("No sessions pending pre-align.")

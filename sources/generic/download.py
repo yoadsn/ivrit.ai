@@ -523,27 +523,19 @@ def main() -> None:
 
     # --- Pre-align stage (optional) ---
     if args.use_prealign and not args.skip_pre_align:
-        # Collect entry dirs that have both audio and transcript.txt ready
-        ready_entry_dirs: list[pathlib.Path] = []
-        for audio_file, transcript_file, maybe_metadata_file, entry_id in entries:
-            entry_dir = output_dir / entry_id
-            transcript_txt = entry_dir / "transcript.txt"
-            has_audio = any(entry_dir.glob("audio.*"))
-            if transcript_txt.exists() and has_audio:
-                ready_entry_dirs.append(entry_dir)
-
-        if ready_entry_dirs:
-            print(f"Pre-aligning {len(ready_entry_dirs)} entry(ies)...")
-            pre_align_sessions(
-                session_dirs=ready_entry_dirs,
-                accurate_text_resolver=_generic_accurate_text_resolver,
-                devices=args.pre_align_devices,
-                model_name=args.pre_align_model_name,
-                compute_type=args.pre_align_compute_type,
-                language=args.language,
-                force=args.force_pre_align or args.force_reprocess,
-                abort_on_error=args.abort_on_error,
-            )
+        entry_ids = [entry_id for _, _, _, entry_id in entries]
+        print("Pre-aligning entries...")
+        pre_align_sessions(
+            output_dir,
+            accurate_text_resolver=_generic_accurate_text_resolver,
+            session_ids=entry_ids,
+            devices=args.pre_align_devices,
+            model_name=args.pre_align_model_name,
+            compute_type=args.pre_align_compute_type,
+            language=args.language,
+            force=args.force_pre_align or args.force_reprocess,
+            abort_on_error=args.abort_on_error,
+        )
 
     # After downloads complete, process normalization if not skipped
     if not args.skip_normalize:

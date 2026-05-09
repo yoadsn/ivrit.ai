@@ -10,9 +10,7 @@ from tqdm import tqdm
 
 from sources.common.pre_align import (
     add_prealign_args,
-)
-from sources.common.pre_align import (
-    pre_align_sessions as _common_pre_align_sessions,
+    pre_align_sessions,
 )
 from sources.knesset.committee.create_maps import (
     add_create_maps_args,
@@ -149,18 +147,8 @@ def _detect_and_flag_empty_audio_sessions(
     return flagged
 
 
-def pre_align_sessions(session_dirs, **kwargs):
-    return _common_pre_align_sessions(
-        session_dirs=session_dirs,
-        accurate_text_resolver=_committee_accurate_text_resolver,
-        **kwargs,
-    )
-
-
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Download and extract Knesset committee session data."
-    )
+    parser = argparse.ArgumentParser(description="Download and extract Knesset committee session data.")
     parser.add_argument(
         "--input-manifest-file",
         type=str,
@@ -208,6 +196,12 @@ def main() -> None:
         type=int,
         default=None,
         help="Maximum number of sessions to process in this run.",
+    )
+    parser.add_argument(
+        "--skip-sessions",
+        type=int,
+        default=None,
+        help="Number of manifest entries to skip before processing. Use with --max-sessions for paging.",
     )
     parser.add_argument(
         "--skip-audio",
@@ -294,13 +288,9 @@ def main() -> None:
         root_logger.setLevel(logging.INFO)
         for handler in root_logger.handlers[:]:
             root_logger.removeHandler(handler)
-        file_handler = RotatingFileHandler(
-            logs_folder / "download_log", maxBytes=5 * 1024 * 1024, backupCount=5
-        )
+        file_handler = RotatingFileHandler(logs_folder / "download_log", maxBytes=5 * 1024 * 1024, backupCount=5)
         file_handler.setLevel(logging.INFO)
-        file_handler.setFormatter(
-            logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-        )
+        file_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
         root_logger.addHandler(file_handler)
         logging.info("Starting Knesset committee download into %s", output_dir)
 
@@ -340,12 +330,21 @@ def main() -> None:
         wanted = set(args.session_ids)
         manifest_entries = [e for e in manifest_entries if e["session_id"] in wanted]
 
+    if args.skip_sessions is not None:
+        manifest_entries = manifest_entries[args.skip_sessions :]
+
     if args.max_sessions is not None:
         manifest_entries = manifest_entries[: args.max_sessions]
 
     if not manifest_entries:
         logging.info("No manifest entries to process.")
         return
+
+    # Derive the effective session ID list from the (already filtered)
+    # manifest entries.  This is the single authoritative limiter used by
+    # every downstream stage, ensuring --session-ids and --max-sessions are
+    # honoured consistently.
+    session_ids: list[str] = [e["session_id"] for e in manifest_entries]
 
     logging.info("Processing %d sessions.", len(manifest_entries))
 
@@ -427,8 +426,6 @@ def main() -> None:
         tqdm.write(f" - Successfully processed session {session_id}")
         return session_output_dir
 
-    ready_session_dirs: list[pathlib.Path] = []
-
     with ThreadPoolExecutor(max_workers=args.download_workers) as executor:
         future_to_entry = {executor.submit(_process_session, entry): entry for entry in manifest_entries}
         with tqdm(total=len(manifest_entries), desc="Processing sessions") as pbar:
@@ -437,9 +434,7 @@ def main() -> None:
                 session_id = entry["session_id"]
                 try:
                     result = future.result()
-                    if result is not None:
-                        ready_session_dirs.append(result)
-                    elif args.abort_on_error:
+                    if result is None and args.abort_on_error:
                         raise RuntimeError(f"Processing failed for session {session_id}")
                 except Exception as e:
                     msg = f" - ERROR: Unexpected error processing session {session_id}: {e}"
@@ -457,7 +452,7 @@ def main() -> None:
         vad_sessions(
             output_dir,
             force=args.force_vad,
-            session_ids=args.session_ids,
+            session_ids=session_ids,
             abort_on_error=args.abort_on_error,
             pretranscode_workers=args.vad_pretranscode_workers,
             presplit_workers=args.vad_presplit_workers,
@@ -468,15 +463,17 @@ def main() -> None:
 
         # --- Empty-audio detection (runs right after VAD) ---
         print("Checking for empty/silent audio sessions...")
-        flagged_ids = _detect_and_flag_empty_audio_sessions(output_dir, args.session_ids)
+        flagged_ids = _detect_and_flag_empty_audio_sessions(output_dir, session_ids)
         if flagged_ids:
-            ready_session_dirs = [d for d in ready_session_dirs if d.name not in flagged_ids]
+            session_ids = [sid for sid in session_ids if sid not in flagged_ids]
 
     # --- Pre-align stage (batch, one worker per device) ---
-    if ready_session_dirs and not args.skip_pre_align and not args.skip_audio:
-        print(f"Pre-aligning {len(ready_session_dirs)} session(s)...")
+    if not args.skip_pre_align and not args.skip_audio:
+        print("Pre-aligning sessions...")
         pre_align_sessions(
-            ready_session_dirs,
+            output_dir,
+            accurate_text_resolver=_committee_accurate_text_resolver,
+            session_ids=session_ids,
             devices=args.pre_align_devices,
             model_name=args.pre_align_model_name,
             compute_type=args.pre_align_compute_type,
@@ -493,11 +490,10 @@ def main() -> None:
             align_model=args.align_model,
             align_devices=args.align_devices or [],
             align_device_density=args.align_device_density,
-            force_normalize_reprocess=args.force_normalize_reprocess
-            or args.force_pre_align,
+            force_normalize_reprocess=args.force_normalize_reprocess or args.force_pre_align,
             force_rescore=args.force_rescore,
             failure_threshold=args.failure_threshold,
-            plenum_ids=args.session_ids,
+            session_ids=session_ids,
             abort_on_error=args.abort_on_error,
         )
 
@@ -506,8 +502,11 @@ def main() -> None:
         print("Refining segment boundaries...")
         refine_segments_sessions(
             output_dir,
-            force=args.force_refine_segments or args.force_vad or args.force_normalize_reprocess or args.force_pre_align,
-            session_ids=args.session_ids,
+            force=args.force_refine_segments
+            or args.force_vad
+            or args.force_normalize_reprocess
+            or args.force_pre_align,
+            session_ids=session_ids,
             abort_on_error=args.abort_on_error,
             min_gap_to_adjust=args.refine_segments_min_gap,
             workers=args.refine_segments_workers,
@@ -518,8 +517,11 @@ def main() -> None:
         print("Creating transcript maps...")
         create_maps_sessions(
             output_dir,
-            force=args.force_create_maps or args.force_refine_segments or args.force_normalize_reprocess or args.force_pre_align,
-            session_ids=args.session_ids,
+            force=args.force_create_maps
+            or args.force_refine_segments
+            or args.force_normalize_reprocess
+            or args.force_pre_align,
+            session_ids=session_ids,
             abort_on_error=args.abort_on_error,
             workers=args.create_maps_workers,
         )
@@ -539,7 +541,6 @@ if __name__ == "__main__":
     import sys
 
     print(
-        "This module is not intended to be executed directly. "
-        "Please use the top-level download.py.",
+        "This module is not intended to be executed directly. " "Please use the top-level download.py.",
         file=sys.stderr,
     )
