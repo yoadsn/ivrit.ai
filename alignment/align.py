@@ -87,6 +87,15 @@ def _fix_alignment_text_integrity(result: stable_whisper.WhisperResult, text_fed
             break
 
     if boundary_idx is None or boundary_idx >= len(all_words) - 1:
+        # --- DEBUG TRACING ---
+        if extra > 0:
+            logger.warning(
+                f"_fix_alignment_text_integrity: {extra} extra chars but "
+                f"boundary_idx={'None' if boundary_idx is None else boundary_idx} "
+                f"(total_words={len(all_words)}) — no non-zero/zero-dur boundary to fix at. "
+                f"result_text_tail={repr(result_text[-40:])}"
+            )
+        # --- END DEBUG TRACING ---
         return  # No zero-duration tail, or last word is the boundary — nothing to fix.
 
     # Text up to and including the boundary word
@@ -107,7 +116,11 @@ def _fix_alignment_text_integrity(result: stable_whisper.WhisperResult, text_fed
         # No clean overlap found, or overlap doesn't explain the full discrepancy.
         # Don't attempt a fix that might corrupt data.
         logger.warning(f"_fix_alignment_text_integrity: detected {extra} extra chars "
-                       f"but overlap_len={overlap_len} — skipping fix.")
+                       f"but overlap_len={overlap_len} — skipping fix. "
+                       f"boundary_idx={boundary_idx}/{len(all_words)}, "
+                       f"text_before_tail={repr(text_before[-30:])}, "
+                       f"text_after_head={repr(text_after[:30])}, "
+                       f"text_after_tail={repr(text_after[-30:])}")
         return
 
     # Remove duplicate words from the start of the zero-duration tail.
