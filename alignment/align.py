@@ -576,12 +576,26 @@ def align_transcript_to_audio(
             else:
                 break
 
-        # If still cannot find - some data corruption is expected.
-        # but we have no better way to recover at this point.
-        # assume all content within the confusion zone span from the unaligned
-        # is to be skipped (this may not contain all text in actual confusion zone. or may
-        # contain text already aligned.
-        # This is a hail-mary attempt
+        # If still cannot find in the time-windowed search, fall back to
+        # searching the full unaligned text.  The prefix MUST exist somewhere
+        # since to_align_next is derived from the same source text.  The
+        # time-based window can miss it when aligned timestamps diverge
+        # significantly from unaligned timestamps.
+        if found_at_text_idx == -1:
+            progress_bar.write(
+                f"Time-windowed search failed in {entry_id or 'entry'}, searching full unaligned text"
+            )
+            # Search all unaligned segments from top_matched_unaligned_timestamp onward
+            segments_around_confusion_zone = unaligned.get_content_by_time(
+                (top_matched_unaligned_timestamp, unaligned.segments[-1].end),
+                segment_level=True,
+            )
+            text_around_confusion_zone = get_text_from_segments(segments_around_confusion_zone)
+            found_at_text_idx = text_around_confusion_zone.find(text_at_start_of_confusion_zone)
+            logger.warning(f"[SKIP-TRACE] full unaligned search: segments={len(segments_around_confusion_zone)}, "
+                           f"text_len={len(text_around_confusion_zone)}, found_at_text_idx={found_at_text_idx}")
+
+        # If STILL cannot find - genuine data corruption.
         if found_at_text_idx == -1:
             progress_bar.write(
                 f"Could not find matching text in {entry_id or 'entry'} confusion zone, slice_start: {slice_start} - hard skip (+corruption) expected"
