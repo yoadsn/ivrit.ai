@@ -172,6 +172,25 @@ def align_transcript_to_audio(
             min_confusion_zone_start = min(min_confusion_zone_start, confusion_zone_start)
             max_confusion_zone_end = max(max_confusion_zone_end, confusion_zone_end)
 
+        # Pre-roll detection: if we haven't aligned anything yet and the
+        # first unaligned segment starts after the confusion zone, the
+        # audio before it is just dead air / pre-roll.  No text needs to
+        # be skipped — simply advance slice_start past the confusion zone
+        # and retry.  We step by confusion-zone increments rather than
+        # jumping to the first unaligned segment, since unaligned
+        # timestamps are only approximate.
+        if (
+            not aligned_pieces
+            and unaligned.segments[0].start >= max_confusion_zone_end
+        ):
+            slice_start = max_confusion_zone_end
+            progress_bar.write(f"Pre-roll detected: advancing audio to {slice_start:.1f}s (first speech estimated at {unaligned.segments[0].start:.1f}s)")
+            logger.info(f"[ALIGN-DBG] PRE-ROLL: no aligned pieces yet, first unaligned seg at {unaligned.segments[0].start:.2f} >= confusion end {max_confusion_zone_end:.2f}, advancing slice_start to {slice_start:.2f}")
+            progress_bar.update(slice_start - progress_bar.n)
+            min_confusion_zone_start = 0
+            max_confusion_zone_end = 0
+            continue
+
         probable_segment_before_confusion_zone = find_probable_segment_before_time(
             aligned,
             confusion_zone_start,
@@ -421,6 +440,33 @@ def align_transcript_to_audio(
             # Mark the top text we took from the unaligned - so we cannot match earlier than that
             # on next iterations
             top_matched_unaligned_timestamp = confusing_segments_to_skip[-1].end
+
+            # Advance segments_after_assumed_confusion_zone past any segments
+            # that were already committed as confusing_segments_to_skip, so that
+            # to_align_next (set below) does not include text already in
+            # aligned_pieces.  This matters when unaligned segments start well
+            # after max_confusion_zone_end (e.g. long audio pre-roll) causing
+            # the "after" set to overlap with the "around" set.
+            #
+            # The skipped segments cover unaligned ids:
+            #   initial_unaligned_segment_id_in_confusion_zone  ..  first_segment_to_continue_aligning.id - 1
+            # (plus the initial segment itself which may have been prefix-trimmed).
+            # We must ensure segments_after does not include any of these.
+            last_skipped_original_id = max(
+                initial_unaligned_segment_id_in_confusion_zone,
+                first_segment_to_continue_aligning.id - 1 if first_segment_to_continue_aligning else initial_unaligned_segment_id_in_confusion_zone,
+            )
+            prev_after_count = len(segments_after_assumed_confusion_zone)
+            segments_after_assumed_confusion_zone = [
+                s for s in segments_after_assumed_confusion_zone if s.id > last_skipped_original_id
+            ]
+            if len(segments_after_assumed_confusion_zone) != prev_after_count:
+                logger.info(f"[ALIGN-DBG] Removed {prev_after_count - len(segments_after_assumed_confusion_zone)} already-skipped segments from segments_after (last_skipped_id={last_skipped_original_id})")
+                if not segments_after_assumed_confusion_zone:
+                    done = True
+                    first_segment_to_continue_aligning = None
+                else:
+                    first_segment_to_continue_aligning = segments_after_assumed_confusion_zone[0]
 
         # Prepare for next align attempt
         if not done:
