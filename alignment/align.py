@@ -432,6 +432,16 @@ def align_transcript_to_audio(
         _strip_spurious_leading_space(aligned, to_align_next)
         _fix_alignment_text_integrity(aligned, to_align_next)
 
+        # --- DEBUG TRACING (main pass post-fix) ---
+        _dbg_aligned_text = ''.join(w.word for s in aligned.segments for w in s.words)
+        if len(_dbg_aligned_text) != len(to_align_next):
+            logger.warning(
+                f"[TRACE main-pass] after _fix: aligned_text_len={len(_dbg_aligned_text)}, "
+                f"to_align_next_len={len(to_align_next)}, diff={len(_dbg_aligned_text) - len(to_align_next)}, "
+                f"aligned_tail={repr(_dbg_aligned_text[-40:])}"
+            )
+        # --- END DEBUG TRACING ---
+
         any_good_alignemnts = aligned.segments[0].start != aligned.segments[-1].end
         # If unable to do any proper alignment - assume a confusion zone up front
         if not any_good_alignemnts:
@@ -488,6 +498,19 @@ def align_transcript_to_audio(
             # Keep properly aligned segments up to it including
             segments_already_aligned = aligned.segments[: probable_segment_before_confusion_zone.id + 1]
             aligned_pieces.extend(segments_already_aligned)
+
+            # --- DEBUG TRACING (commit segments_already_aligned) ---
+            _dbg_committed_text = ''.join(w.word for s in aligned_pieces for w in s.words)
+            _dbg_committed_tail = _dbg_committed_text[-60:]
+            _dbg_remaining_text = get_text_from_segments(aligned.segments[probable_segment_before_confusion_zone.id + 1 :])
+            logger.warning(
+                f"[TRACE commit] committed_total_len={len(_dbg_committed_text)}, "
+                f"remaining_len={len(_dbg_remaining_text)}, "
+                f"probable_seg_id={probable_segment_before_confusion_zone.id}, "
+                f"committed_tail={repr(_dbg_committed_tail)}, "
+                f"remaining_head={repr(_dbg_remaining_text[:60])}"
+            )
+            # --- END DEBUG TRACING ---
 
             # point to audio start for next try
             slice_start = probable_segment_before_confusion_zone.end
@@ -711,6 +734,18 @@ def align_transcript_to_audio(
             # Remove text that may have been duplicated across the main alignment
             # pass (zero-duration tail) and this skip pass (zero-duration head).
             deduped_skipped = _remove_cross_call_text_overlap(aligned_pieces, aligned_skipped.segments)
+
+            # --- DEBUG TRACING (skip-pass commit) ---
+            _dbg_pieces_tail = ''.join(w.word for s in aligned_pieces[-3:] for w in s.words) if aligned_pieces else ''
+            _dbg_skip_head = ''.join(w.word for s in deduped_skipped[:3] for w in s.words) if deduped_skipped else ''
+            logger.warning(
+                f"[TRACE skip-commit] pieces_tail={repr(_dbg_pieces_tail[-40:])}, "
+                f"skip_head={repr(_dbg_skip_head[:40])}, "
+                f"skipped_text_len={len(skipped_text_to_align)}, "
+                f"deduped_segs={len(deduped_skipped)}"
+            )
+            # --- END DEBUG TRACING ---
+
             aligned_pieces.extend(deduped_skipped)  # consider this done (although it's unaligned == estimated)
 
             # Mark the top text we took from the unaligned - so we cannot match earlier than that
@@ -771,6 +806,28 @@ def align_transcript_to_audio(
         # Forget prev confusion zone
         min_confusion_zone_start = 0
         max_confusion_zone_end = 0
+
+    # --- DEBUG TRACING (final integrity check) ---
+    _dbg_final_text = ''.join(w.word for s in aligned_pieces for w in s.words)
+    _dbg_expected_text = unaligned.text
+    if len(_dbg_final_text) != len(_dbg_expected_text):
+        logger.warning(
+            f"[TRACE final] INTEGRITY MISMATCH: final_len={len(_dbg_final_text)}, "
+            f"expected_len={len(_dbg_expected_text)}, diff={len(_dbg_final_text) - len(_dbg_expected_text)}"
+        )
+        # Find where the difference is
+        import difflib as _dl
+        for _op, _a1, _a2, _b1, _b2 in _dl.SequenceMatcher(None, _dbg_expected_text, _dbg_final_text).get_opcodes():
+            if _op != 'equal':
+                logger.warning(
+                    f"[TRACE final]   {_op} at expected[{_a1}:{_a2}] final[{_b1}:{_b2}]: "
+                    f"expected={repr(_dbg_expected_text[_a1:_a2])}, "
+                    f"final={repr(_dbg_final_text[_b1:_b2])}, "
+                    f"context=...{repr(_dbg_expected_text[max(0,_a1-20):_a1])}|HERE|{repr(_dbg_expected_text[_a2:_a2+20])}..."
+                )
+    else:
+        logger.warning(f"[TRACE final] OK: final_len={len(_dbg_final_text)} matches expected")
+    # --- END DEBUG TRACING ---
 
     final_aligned = create_transcript_from_segments(aligned_pieces)
 
