@@ -75,6 +75,19 @@ def align_transcript_to_audio(
     else:
         unaligned = transcript
 
+    # The Whisper tokenizer replaces newlines with spaces during encode/decode,
+    # so the aligned output will never contain newlines.  Normalise the unaligned
+    # text in-place now so that (a) the confusion-zone text-matching (find() calls
+    # below) works correctly, and (b) character counts stay identical (\n and space
+    # are both one character).
+    for seg in unaligned.segments:
+        if '\n' in seg.text:
+            seg.text = seg.text.replace('\n', ' ')
+        if seg.words:
+            for word in seg.words:
+                if '\n' in word.word:
+                    word.word = word.word.replace('\n', ' ')
+
     # If model is a string, load it using get_breakable_align_model
     if isinstance(model, str):
         model = get_breakable_align_model(model, device, align_model_compute_type)
