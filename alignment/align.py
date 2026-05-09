@@ -17,6 +17,30 @@ from alignment.utils import (
 from utils.vtt import vtt_to_whisper_result
 
 
+def _strip_spurious_leading_space(result: stable_whisper.WhisperResult, text_fed: str) -> None:
+    """Strip a spurious leading space from the first word of an alignment result.
+
+    The Whisper tokenizer prepends a space to the first token of every sequence it
+    encodes (word-boundary convention).  When the text we fed to model.align() did
+    NOT start with a space, that leading space is an artefact and must be removed so
+    that the concatenated output text stays identical to the input transcript text.
+
+    Operates in-place on *result*.
+    """
+    if text_fed.startswith(' '):
+        # The original text already had a leading space – nothing to strip.
+        return
+    if not result.segments:
+        return
+    first_seg = result.segments[0]
+    if first_seg.words:
+        first_word = first_seg.words[0]
+        if first_word.word.startswith(' '):
+            first_word.word = first_word.word[1:]
+    elif first_seg._default_text.startswith(' '):
+        first_seg._default_text = first_seg._default_text[1:]
+
+
 def align_transcript_to_audio(
     audio_file: Path,
     transcript: Union[Path, stable_whisper.result.WhisperResult],
@@ -130,6 +154,7 @@ def align_transcript_to_audio(
         aligned: stable_whisper.WhisperResult = model.align(
             audio, to_align_next, language=language, failure_threshold=zero_duration_segments_failure_ratio
         )
+        _strip_spurious_leading_space(aligned, to_align_next)
 
         any_good_alignemnts = aligned.segments[0].start != aligned.segments[-1].end
         # If unable to do any proper alignment - assume a confusion zone up front
@@ -394,6 +419,7 @@ def align_transcript_to_audio(
             aligned_skipped: stable_whisper.WhisperResult = model.align(
                 audio, skipped_text_to_align, language=language, failure_threshold=zero_duration_segments_failure_ratio
             )
+            _strip_spurious_leading_space(aligned_skipped, skipped_text_to_align)
 
             # Ensure none of the segments has a start/end below the top aligned timestamp
             # or over the confusion zone audio slice end
