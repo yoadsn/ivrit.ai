@@ -178,12 +178,6 @@ def _create_map_for_transcript(
     aligned_data = json.loads(transcript_path.read_text(encoding="utf-8"))
     segments = aligned_data.get("segments", [])
 
-    # The aligner (stable_whisper) prepends a leading space to the text as a
-    # tokenizer artifact.  Strip it from the first segment so that character
-    # offsets align 1:1 with raw.protocol.txt.
-    if segments and segments[0].get("text", "").startswith(" "):
-        segments[0] = {**segments[0], "text": segments[0]["text"][1:]}
-
     # Verify that concatenated segment text length matches raw.protocol.txt.
     # If they diverge the direct offset computation would produce garbage.
     aligned_total = sum(len(seg.get("text", "")) for seg in segments)
