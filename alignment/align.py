@@ -1,4 +1,3 @@
-import logging
 from pathlib import Path
 from typing import Union
 
@@ -6,8 +5,6 @@ import stable_whisper
 from faster_whisper import WhisperModel
 from stable_whisper.whisper_compatibility import SAMPLE_RATE
 from tqdm import tqdm
-
-logger = logging.getLogger(__name__)
 
 from alignment.seekable_audio_loader import SeekableAudioLoader
 from alignment.utils import (
@@ -117,12 +114,7 @@ def align_transcript_to_audio(
 
     # Create a progress bar for the alignment process
     progress_bar = tqdm(total=audio_duration, unit="sec", desc=f"Aligning {entry_id or 'Entry'}")
-    iteration = 0
     while not done:
-        iteration += 1
-        logger.info(f"[ALIGN-DBG] === Iteration {iteration} ===")
-        logger.info(f"[ALIGN-DBG] slice_start={slice_start}, to_align_next length={len(to_align_next)}, to_align_next[:80]={to_align_next[:80]!r}")
-        logger.info(f"[ALIGN-DBG] aligned_pieces count={len(aligned_pieces)}, total text in pieces={sum(len(s.text) for s in aligned_pieces)}")
         # Get the audio slice
         audio = SeekableAudioLoader(
             str(audio_file),
@@ -140,9 +132,6 @@ def align_transcript_to_audio(
         )
 
         any_good_alignemnts = aligned.segments[0].start != aligned.segments[-1].end
-        logger.info(f"[ALIGN-DBG] model.align returned {len(aligned.segments)} segments, any_good_alignments={any_good_alignemnts}")
-        logger.info(f"[ALIGN-DBG] aligned seg[0]: start={aligned.segments[0].start:.2f} end={aligned.segments[0].end:.2f} text={aligned.segments[0].text[:60]!r}")
-        logger.info(f"[ALIGN-DBG] aligned seg[-1]: start={aligned.segments[-1].start:.2f} end={aligned.segments[-1].end:.2f} text={aligned.segments[-1].text[:60]!r}")
         # If unable to do any proper alignment - assume a confusion zone up front
         if not any_good_alignemnts:
             confusion_zone_start = slice_start
@@ -151,12 +140,9 @@ def align_transcript_to_audio(
             # find the confusion zone
             confusion_zone_start, confusion_zone_end = get_confusion_zone(aligned)
 
-        logger.info(f"[ALIGN-DBG] confusion_zone: start={confusion_zone_start}, end={confusion_zone_end}")
-
         # Check if done == No confusion zone exists
         if confusion_zone_start is None:
             # Keep aligned segments and stop aligning
-            logger.info(f"[ALIGN-DBG] DONE: no confusion zone, committing all {len(aligned.segments)} segments")
             aligned_pieces.extend(aligned.segments)
             break
 
@@ -174,18 +160,17 @@ def align_transcript_to_audio(
 
         # Pre-roll detection: if we haven't aligned anything yet and the
         # first unaligned segment starts after the confusion zone, the
-        # audio before it is just dead air / pre-roll.  No text needs to
-        # be skipped — simply advance slice_start past the confusion zone
+        # audio before it is just dead air / pre-roll. No text needs to
+        # be skipped; simply advance slice_start past the confusion zone
         # and retry.  We step by confusion-zone increments rather than
         # jumping to the first unaligned segment, since unaligned
         # timestamps are only approximate.
-        if (
-            not aligned_pieces
-            and unaligned.segments[0].start >= max_confusion_zone_end
-        ):
+        if not aligned_pieces and unaligned.segments[0].start >= max_confusion_zone_end:
             slice_start = max_confusion_zone_end
-            progress_bar.write(f"Pre-roll detected: advancing audio to {slice_start:.1f}s (first speech estimated at {unaligned.segments[0].start:.1f}s)")
-            logger.info(f"[ALIGN-DBG] PRE-ROLL: no aligned pieces yet, first unaligned seg at {unaligned.segments[0].start:.2f} >= confusion end {max_confusion_zone_end:.2f}, advancing slice_start to {slice_start:.2f}")
+            progress_bar.write(
+                f"Pre-roll detected: advancing audio to {slice_start:.1f}s "
+                f"(first speech estimated at {unaligned.segments[0].start:.1f}s)"
+            )
             progress_bar.update(slice_start - progress_bar.n)
             min_confusion_zone_start = 0
             max_confusion_zone_end = 0
@@ -197,16 +182,10 @@ def align_transcript_to_audio(
             pre_confusion_zone_backward_skip_search_duration_window,
         )
 
-        logger.info(f"[ALIGN-DBG] probable_segment_before_confusion_zone={probable_segment_before_confusion_zone is not None}")
-        if probable_segment_before_confusion_zone is not None:
-            logger.info(f"[ALIGN-DBG]   probable seg id={probable_segment_before_confusion_zone.id}, start={probable_segment_before_confusion_zone.start:.2f}, end={probable_segment_before_confusion_zone.end:.2f}, text={probable_segment_before_confusion_zone.text[:60]!r}")
-
         # If there is a probable segment before confusion zone
         if probable_segment_before_confusion_zone is not None:
             # Keep properly aligned segments up to it including
             segments_already_aligned = aligned.segments[: probable_segment_before_confusion_zone.id + 1]
-            logger.info(f"[ALIGN-DBG] COMMITTING {len(segments_already_aligned)} segments to aligned_pieces (line 184)")
-            logger.info(f"[ALIGN-DBG]   committed text length={sum(len(s.text) for s in segments_already_aligned)}, first={segments_already_aligned[0].text[:40]!r}")
             aligned_pieces.extend(segments_already_aligned)
 
             # point to audio start for next try
@@ -217,19 +196,16 @@ def align_transcript_to_audio(
 
             # Prepare not aligned text for next try
             to_align_next = get_text_from_segments(aligned.segments[probable_segment_before_confusion_zone.id + 1 :])
-            logger.info(f"[ALIGN-DBG] to_align_next set from remaining segments, length={len(to_align_next)}, starts with={to_align_next[:60]!r}")
 
             # If we have more tries left for the "pre confusion zone" retry strategy
             if current_pre_confusion_zone_tries < max_pre_confusion_zone_tries_before_skip:
                 progress_bar.write(f"Retry alignment from before confusion zone: {slice_start}")
-                logger.info(f"[ALIGN-DBG] RETRY: pre_confusion try {current_pre_confusion_zone_tries+1}/{max_pre_confusion_zone_tries_before_skip}, continuing loop")
                 # another pre confusion zone try is done
                 current_pre_confusion_zone_tries += 1
                 continue
 
         # Skipping forward - to_align_next is all the text we tried to align in this attempt
         # of course we will skip some of it after deciding where to skip to
-        logger.info(f"[ALIGN-DBG] Entering SKIP-FORWARD path (retries exhausted or no probable segment)")
 
         # Assume confusion starts where the audio starts.
         min_confusion_zone_start = slice_start
@@ -289,11 +265,9 @@ def align_transcript_to_audio(
                 segment_level=True,
             )
             text_around_confusion_zone = get_text_from_segments(segments_around_confusion_zone)
-            logger.info(f"[ALIGN-DBG] segments_around_confusion_zone: count={len(segments_around_confusion_zone)}, search_window=({search_in_unaligned_window_time_start:.2f}, {search_in_unaligned_window_time_end:.2f})")
 
             # where can we find the prefix text ?
             found_at_text_idx = text_around_confusion_zone.find(text_at_start_of_confusion_zone)
-            logger.info(f"[ALIGN-DBG] text match: found_at_text_idx={found_at_text_idx}, search_radius={search_radius_to_try}")
 
             # prepare for next try or break
             if found_at_text_idx == -1:
@@ -323,7 +297,6 @@ def align_transcript_to_audio(
         segments_after_assumed_confusion_zone = unaligned.get_content_by_time(
             (max_confusion_zone_end, unaligned.segments[-1].end), segment_level=True
         )
-        logger.info(f"[ALIGN-DBG] segments_after_assumed_confusion_zone: count={len(segments_after_assumed_confusion_zone)}, max_confusion_zone_end={max_confusion_zone_end:.2f}")
 
         # Ensure the segments we will align next start after the max_confusion_zone_end
         # so the skip will be effective.
@@ -332,7 +305,6 @@ def align_transcript_to_audio(
             and segments_after_assumed_confusion_zone[0].start < max_confusion_zone_end
         ):
             segments_after_assumed_confusion_zone = segments_after_assumed_confusion_zone[1:]
-            logger.info(f"[ALIGN-DBG] trimmed first segment (was before confusion end), now count={len(segments_after_assumed_confusion_zone)}")
 
         # find the segment that contains the start idx
         # and the index of the text within that segment
@@ -382,7 +354,6 @@ def align_transcript_to_audio(
         # If segments found within/around confusion zone
         # Handle their skipping, and adding them to the "aligned" pieces
         # as if they were aligned.
-        logger.info(f"[ALIGN-DBG] segments_around_confusion_zone: {len(segments_around_confusion_zone) if segments_around_confusion_zone else 0} segments, done={done}")
         if segments_around_confusion_zone:
             # make sure all unaligned are added to results before existing
             if done:
@@ -461,7 +432,6 @@ def align_transcript_to_audio(
                 s for s in segments_after_assumed_confusion_zone if s.id > last_skipped_original_id
             ]
             if len(segments_after_assumed_confusion_zone) != prev_after_count:
-                logger.info(f"[ALIGN-DBG] Removed {prev_after_count - len(segments_after_assumed_confusion_zone)} already-skipped segments from segments_after (last_skipped_id={last_skipped_original_id})")
                 if not segments_after_assumed_confusion_zone:
                     done = True
                     first_segment_to_continue_aligning = None
@@ -479,13 +449,11 @@ def align_transcript_to_audio(
                 # probable segment) to avoid re-including text that was
                 # already committed to aligned_pieces.  We only need to
                 # fix slice_start to point to the correct audio position
-                # for that text — use the first unaligned segment that
+                # for that text: use the first unaligned segment that
                 # starts after the confusion zone.
-                logger.info(f"[ALIGN-DBG] FIX PATH: segments_around_confusion_zone empty + probable_segment found -> keeping to_align_next (len={len(to_align_next)}), setting slice_start={first_segment_to_continue_aligning.start:.2f}")
                 slice_start = first_segment_to_continue_aligning.start
             else:
                 to_align_next = get_text_from_segments(segments_after_assumed_confusion_zone)
-                logger.info(f"[ALIGN-DBG] NORMAL PATH: to_align_next from segments_after_confusion, len={len(to_align_next)}, slice_start={first_segment_to_continue_aligning.start:.2f}")
 
                 # next audio start is the confusion zone end or the start of the
                 # first segment to align - which ever comes first
@@ -500,14 +468,6 @@ def align_transcript_to_audio(
         max_confusion_zone_end = 0
 
     final_aligned = create_transcript_from_segments(aligned_pieces)
-
-    logger.info(f"[ALIGN-DBG] FINAL: {len(aligned_pieces)} pieces, total text length={sum(len(s.text) for s in aligned_pieces)}")
-    # Check for duplication at start
-    if len(aligned_pieces) >= 6:
-        t012 = ''.join(s.text for s in aligned_pieces[:3])
-        t345 = ''.join(s.text for s in aligned_pieces[3:6])
-        if t012 == t345:
-            logger.warning(f"[ALIGN-DBG] DUPLICATION DETECTED: segments 0-2 == segments 3-5, text={t012[:80]!r}")
 
     # Close the progress bar
     progress_bar.close()
