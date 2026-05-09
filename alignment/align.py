@@ -20,194 +20,213 @@ from alignment.utils import (
 from utils.vtt import vtt_to_whisper_result
 
 
-def _strip_spurious_leading_space(result: stable_whisper.WhisperResult, text_fed: str) -> None:
-    """Strip a spurious leading space from the first word of an alignment result.
+def _sanitize_align_result(result: stable_whisper.WhisperResult, text_fed: str) -> None:
+    """Clean up a model.align() result so its concatenated word text matches text_fed.
 
-    The Whisper tokenizer prepends a space to the first token of every sequence it
-    encodes (word-boundary convention).  When the text we fed to model.align() did
-    NOT start with a space, that leading space is an artefact and must be removed so
-    that the concatenated output text stays identical to the input transcript text.
+    model.align() from stable_whisper has a known bug: it can duplicate text in
+    zero-duration words (words where start == end) that appear when alignment
+    partially fails.  The duplication can occur:
+
+    - At the boundary between properly-aligned and zero-duration words.
+    - Deep inside a run of zero-duration words.
+    - Across the entire result when all words are zero-duration.
+
+    This function also strips the spurious leading space that the Whisper tokenizer
+    prepends to the first token of every sequence.
 
     Operates in-place on *result*.
+
+    Strategy (ordered from cheapest to most expensive):
+
+    1. **Leading space** — if text_fed does not start with a space but the result
+       does, strip the leading space from the first word.  O(1).
+
+    2. **Quick exit** — if lengths already match after step 1, return.  O(n) for
+       one concatenation pass.
+
+    3. **Boundary overlap** — look for a suffix/prefix overlap at the last
+       non-zero/zero-duration word boundary.  Handles the most common duplication
+       pattern.  O(extra) string comparisons.
+
+    4. **Exhaustive scan** — sliding window over all zero-duration word runs
+       looking for a contiguous group of exactly ``extra`` chars whose removal
+       yields text_fed.  O(zero_dur_words * avg_dup_span) with early exit.
+       Sub-millisecond even for 2000+ zero-duration words.
     """
-    if text_fed.startswith(' '):
-        # The original text already had a leading space – nothing to strip.
-        return
     if not result.segments:
         return
-    first_seg = result.segments[0]
-    if first_seg.words:
-        first_word = first_seg.words[0]
-        if first_word.word.startswith(' '):
-            first_word.word = first_word.word[1:]
-    elif first_seg._default_text.startswith(' '):
-        first_seg._default_text = first_seg._default_text[1:]
 
+    # ------------------------------------------------------------------
+    # Step 1: Strip spurious leading space
+    # ------------------------------------------------------------------
+    if not text_fed.startswith(' '):
+        first_seg = result.segments[0]
+        if first_seg.words:
+            if first_seg.words[0].word.startswith(' '):
+                first_seg.words[0].word = first_seg.words[0].word[1:]
+        elif first_seg._default_text.startswith(' '):
+            first_seg._default_text = first_seg._default_text[1:]
 
-def _fix_alignment_text_integrity(result: stable_whisper.WhisperResult, text_fed: str) -> None:
-    """Fix text duplication that stable_whisper may introduce at alignment-failure boundaries.
-
-    When model.align() partially fails (e.g. near the end of audio), it can produce
-    zero-duration segments whose text overlaps with the last properly-aligned segment.
-    For example, the last real segment ends with word "בו," and the first zero-duration
-    segment also starts with word "בו," — duplicating that text.
-
-    This function detects the boundary between properly-aligned words and zero-duration
-    words, checks if the total concatenated word text matches text_fed, and if not,
-    removes duplicate words at the boundary until the text matches.
-
-    Operates in-place on *result*.
-    """
+    # ------------------------------------------------------------------
+    # Step 2: Quick length check
+    # ------------------------------------------------------------------
     all_words = result.all_words()
     if not all_words:
         return
 
-    # Build the concatenated word text and compare with input.
-    # Compare lengths first: if they differ we know there's a mismatch without
-    # a full string comparison; only do the (slower) equality check when lengths
-    # are identical (the common no-duplication case).
     result_text = ''.join(w.word for w in all_words)
-    result_len = len(result_text)
-    fed_len = len(text_fed)
-    if result_len == fed_len:
-        # Or - Same length but different content — not a duplication issue we handle.
+    extra = len(result_text) - len(text_fed)
+
+    if extra == 0:
+        return  # Nothing to fix
+    if extra < 0:
+        # Result is shorter than expected — not a duplication issue we can fix.
+        logger.warning(
+            f"_sanitize_align_result: result is {-extra} chars shorter than text_fed "
+            f"({len(result_text)} vs {len(text_fed)}); cannot fix."
+        )
         return
 
-    # Only handle the case where the result is LONGER than expected (duplication).
-    extra = result_len - fed_len
-    if extra <= 0:
-        return
-
-    # Find the boundary: last word with non-zero duration followed by zero-duration words.
-    # The duplication happens at this boundary.
+    # ------------------------------------------------------------------
+    # Step 3: Boundary overlap (fast path for the most common pattern)
+    # ------------------------------------------------------------------
+    # Find boundary: last word with non-zero duration.
     boundary_idx = None
     for i in range(len(all_words) - 1, -1, -1):
         if all_words[i].end > all_words[i].start:
             boundary_idx = i
             break
 
-    if boundary_idx is None or boundary_idx >= len(all_words) - 1:
-        # --- DEBUG TRACING ---
-        if extra > 0:
-            logger.warning(
-                f"_fix_alignment_text_integrity: {extra} extra chars but "
-                f"boundary_idx={'None' if boundary_idx is None else boundary_idx} "
-                f"(total_words={len(all_words)}) — no non-zero/zero-dur boundary to fix at. "
-                f"result_text_tail={repr(result_text[-40:])}"
-            )
-        # --- END DEBUG TRACING ---
-        return  # No zero-duration tail, or last word is the boundary — nothing to fix.
+    if boundary_idx is not None and boundary_idx < len(all_words) - 1:
+        text_before = ''.join(w.word for w in all_words[: boundary_idx + 1])
+        text_after = ''.join(w.word for w in all_words[boundary_idx + 1 :])
 
-    # Text up to and including the boundary word
-    text_before = ''.join(w.word for w in all_words[: boundary_idx + 1])
-    # Text of the zero-duration tail
-    text_after = ''.join(w.word for w in all_words[boundary_idx + 1 :])
+        # Check suffix of text_before == prefix of text_after
+        overlap_len = 0
+        max_check = min(len(text_before), len(text_after), extra + 5)
+        for length in range(1, max_check + 1):
+            if text_before.endswith(text_after[:length]):
+                overlap_len = length
 
-    # Find the overlap: the end of text_before that matches the start of text_after.
-    # For example: text_before ends with " בו," and text_after starts with " בו, ואני..."
-    # The overlap is " בו," (4 chars including leading space).
-    overlap_len = 0
-    max_check = min(len(text_before), len(text_after), extra + 5)  # small buffer
-    for length in range(1, max_check + 1):
-        if text_before.endswith(text_after[:length]):
-            overlap_len = length
+        if overlap_len == extra:
+            if _remove_zero_dur_words_at(result, all_words, boundary_idx + 1, overlap_len):
+                logger.warning(
+                    f"_sanitize_align_result: removed {overlap_len} duplicate chars "
+                    f"at boundary (word {boundary_idx})."
+                )
+                return
 
-    if overlap_len == 0 or overlap_len != extra:
-        # No clean overlap found, or overlap doesn't explain the full discrepancy.
-        # Don't attempt a fix that might corrupt data.
-        logger.warning(f"_fix_alignment_text_integrity: detected {extra} extra chars "
-                       f"but overlap_len={overlap_len} — skipping fix. "
-                       f"boundary_idx={boundary_idx}/{len(all_words)}, "
-                       f"text_before_tail={repr(text_before[-30:])}, "
-                       f"text_after_head={repr(text_after[:30])}, "
-                       f"text_after_tail={repr(text_after[-30:])}")
+    # ------------------------------------------------------------------
+    # Step 4: Exhaustive scan over zero-duration word runs
+    # ------------------------------------------------------------------
+    # Build word char offsets
+    word_starts = []
+    pos = 0
+    for w in all_words:
+        word_starts.append(pos)
+        pos += len(w.word)
+
+    # Collect contiguous runs of zero-duration words
+    zero_dur_indices = [i for i, w in enumerate(all_words) if w.start == w.end]
+    if not zero_dur_indices:
+        logger.warning(
+            f"_sanitize_align_result: {extra} extra chars but no zero-duration words "
+            f"to remove; cannot fix."
+        )
         return
 
-    # Remove duplicate words from the start of the zero-duration tail.
-    # Walk forward from boundary_idx+1, removing words until we've removed
-    # exactly overlap_len characters.
-    chars_removed = 0
-    words_to_remove = 0
-    for i in range(boundary_idx + 1, len(all_words)):
-        word_len = len(all_words[i].word)
-        if chars_removed + word_len <= overlap_len:
-            chars_removed += word_len
-            words_to_remove += 1
+    runs = []
+    run_start = zero_dur_indices[0]
+    prev = zero_dur_indices[0]
+    for idx in zero_dur_indices[1:]:
+        if idx == prev + 1:
+            prev = idx
         else:
-            break
+            runs.append((run_start, prev))
+            run_start = idx
+            prev = idx
+    runs.append((run_start, prev))
 
-    if chars_removed == overlap_len:
-        # Clean removal: drop these words from their parent segments.
-        removed = 0
-        for seg in result.segments:
-            if not seg.words or removed >= words_to_remove:
-                continue
-            # Find words to remove in this segment
-            new_words = []
-            for w in seg.words:
-                if removed < words_to_remove and w.start == w.end and w.start == all_words[boundary_idx + 1 + removed].start:
-                    # Check this is actually one of the duplicate words
-                    if removed < words_to_remove:
-                        removed += 1
-                        continue
-                new_words.append(w)
-            seg.words = new_words
+    for rs, re in runs:
+        i = rs
+        while i <= re:
+            chars = 0
+            j = i
+            while j <= re:
+                chars += len(all_words[j].word)
+                if chars == extra:
+                    candidate = (
+                        result_text[:word_starts[i]]
+                        + result_text[word_starts[j] + len(all_words[j].word) :]
+                    )
+                    if candidate == text_fed:
+                        n_words = j - i + 1
+                        target = set(id(all_words[k]) for k in range(i, j + 1))
+                        for seg in result.segments:
+                            if seg.words:
+                                seg.words = [w for w in seg.words if id(w) not in target]
+                        result.segments = [s for s in result.segments if s.words]
+                        logger.warning(
+                            f"_sanitize_align_result: removed {n_words} duplicate words "
+                            f"({extra} chars at word {i}, char pos {word_starts[i]}) "
+                            f"via exhaustive scan."
+                        )
+                        return
+                    break  # This sub-run text didn't match; advance start
+                elif chars > extra:
+                    break
+                j += 1
+            i += 1
 
-        # Remove any segments that ended up with no words
-        result.segments = [s for s in result.segments if s.words or not hasattr(s, 'words') or s.words is None]
+    logger.warning(
+        f"_sanitize_align_result: could not fix {extra} extra chars "
+        f"({len(all_words)} words, {len(zero_dur_indices)} zero-dur). "
+        f"Result text will not match text_fed."
+    )
 
-        logger.warning(f"_fix_alignment_text_integrity: removed {words_to_remove} duplicate "
-                       f"words ({chars_removed} chars) at alignment failure boundary.")
-    elif chars_removed < overlap_len:
-        # Partial word overlap: trim the text of the first zero-duration word.
-        # e.g. the duplicate straddles a word boundary.
-        remaining_trim = overlap_len - chars_removed
-        next_word_idx = boundary_idx + 1 + words_to_remove
-        if next_word_idx < len(all_words):
-            w = all_words[next_word_idx]
-            if w.start == w.end and w.word[:remaining_trim] == text_before[-remaining_trim:]:
-                # Remove whole duplicate words first
-                removed = 0
-                for seg in result.segments:
-                    if not seg.words or removed >= words_to_remove:
-                        continue
-                    new_words = []
-                    for word in seg.words:
-                        if removed < words_to_remove and word.start == word.end:
-                            removed += 1
-                            continue
-                        new_words.append(word)
-                    seg.words = new_words
 
-                # Trim the partial word
-                w.word = w.word[remaining_trim:]
-                result.segments = [s for s in result.segments if s.words]
+def _remove_zero_dur_words_at(
+    result: stable_whisper.WhisperResult,
+    all_words: list,
+    start_idx: int,
+    chars_to_remove: int,
+) -> bool:
+    """Remove contiguous zero-duration words starting at start_idx totalling chars_to_remove.
 
-                logger.warning(f"_fix_alignment_text_integrity: removed {words_to_remove} words "
-                               f"+ trimmed {remaining_trim} chars from partial word at boundary.")
+    Returns True if exactly chars_to_remove characters were removed, False otherwise.
+    """
+    chars = 0
+    end_idx = start_idx
+    while end_idx < len(all_words):
+        w = all_words[end_idx]
+        if w.start != w.end:
+            break  # Hit a real-duration word
+        chars += len(w.word)
+        if chars == chars_to_remove:
+            # Remove words start_idx..end_idx (inclusive)
+            target = set(id(all_words[k]) for k in range(start_idx, end_idx + 1))
+            for seg in result.segments:
+                if seg.words:
+                    seg.words = [w for w in seg.words if id(w) not in target]
+            result.segments = [s for s in result.segments if s.words]
+            return True
+        elif chars > chars_to_remove:
+            break  # Overshot — can't remove on word boundaries
+        end_idx += 1
+    return False
 
 
 def _remove_cross_call_text_overlap(
     committed_pieces: list[stable_whisper.result.Segment],
     new_segments: list[stable_whisper.result.Segment],
 ) -> list[stable_whisper.result.Segment]:
-    """Remove text overlap between the tail of already-committed pieces and the
-    head of newly-produced segments from a different alignment call.
+    """Remove text overlap between committed aligned pieces and new skip-pass segments.
 
-    When the main alignment pass produces a zero-duration tail (alignment ran out
-    of audio) and the subsequent confusion-zone skip pass starts with text that
-    overlaps that tail, the same text appears twice.  For example:
+    Safety net for cross-call duplication: if the main alignment pass committed a
+    zero-duration tail and the skip pass starts with overlapping text, remove the
+    duplicate words from the head of new_segments.
 
-        committed tail:  "...העבודה עצמה תתחבר ותשתנה."   (zero-duration)
-        new head:        " ותשתנה. איפה אפשר לשנות? ..."  (zero-duration)
-
-    This function detects such overlaps and removes the duplicate words from the
-    start of *new_segments*, returning the (possibly trimmed) list.
-
-    Only removes overlap when:
-    - The tail of committed_pieces contains zero-duration words
-    - The head of new_segments contains zero-duration words
-    - There is a textual suffix/prefix overlap between them
+    Returns the (possibly trimmed) new_segments list.
     """
     if not committed_pieces or not new_segments:
         return new_segments
@@ -221,11 +240,11 @@ def _remove_cross_call_text_overlap(
             if w.start == w.end:
                 tail_zero_words.append(w)
             else:
-                break  # Hit a real-duration word, stop
+                break
+        # If we found zero-dur words and this segment started with a real word, stop
         if tail_zero_words and seg.words and seg.words[0].start != seg.words[0].end:
-            break  # This segment had a mix; we've collected the zero-duration tail
+            break
         if not tail_zero_words:
-            # No zero-duration words at all in the last segment — no overlap possible
             return new_segments
     tail_zero_words.reverse()
 
@@ -243,9 +262,9 @@ def _remove_cross_call_text_overlap(
             if w.start == w.end:
                 head_zero_words.append(w)
             else:
-                break  # Hit a real-duration word, stop
+                break
         if head_zero_words and seg.words and seg.words[-1].start != seg.words[-1].end:
-            continue  # Entire segment was zero-duration, check next
+            continue
         break
 
     if not head_zero_words:
@@ -253,7 +272,7 @@ def _remove_cross_call_text_overlap(
 
     head_text = ''.join(w.word for w in head_zero_words)
 
-    # Find overlap: suffix of tail_text that matches prefix of head_text
+    # Find overlap: suffix of tail_text == prefix of head_text
     overlap_len = 0
     max_check = min(len(tail_text), len(head_text))
     for length in range(1, max_check + 1):
@@ -263,69 +282,29 @@ def _remove_cross_call_text_overlap(
     if overlap_len == 0:
         return new_segments
 
-    # Remove exactly overlap_len characters worth of words from the head of new_segments
-    chars_to_remove = overlap_len
+    # Remove exactly overlap_len chars from the head of new_segments
     chars_removed = 0
     words_removed = 0
-
     for w in head_zero_words:
-        word_len = len(w.word)
-        if chars_removed + word_len <= chars_to_remove:
-            chars_removed += word_len
+        if chars_removed + len(w.word) <= overlap_len:
+            chars_removed += len(w.word)
             words_removed += 1
         else:
             break
 
-    if chars_removed == chars_to_remove:
-        # Clean word-boundary removal — drop these words from their segments
-        removed = 0
-        for seg in new_segments:
-            if not seg.words or removed >= words_removed:
-                break
-            new_words = []
-            for w in seg.words:
-                if removed < words_removed and w.start == w.end:
-                    removed += 1
-                    continue
-                new_words.append(w)
-            seg.words = new_words
+    if chars_removed != overlap_len:
+        return new_segments  # Can't remove on clean word boundaries
 
-        # Remove empty segments
-        new_segments = [s for s in new_segments if s.words]
+    target = set(id(head_zero_words[i]) for i in range(words_removed))
+    for seg in new_segments:
+        if seg.words:
+            seg.words = [w for w in seg.words if id(w) not in target]
+    new_segments = [s for s in new_segments if s.words]
 
-        logger.warning(
-            f"_remove_cross_call_text_overlap: removed {words_removed} duplicate "
-            f"words ({chars_removed} chars) at cross-call boundary."
-        )
-    elif chars_removed < chars_to_remove:
-        # Partial word overlap — trim the text of the next word
-        remaining_trim = chars_to_remove - chars_removed
-        next_word = head_zero_words[words_removed] if words_removed < len(head_zero_words) else None
-        if next_word and next_word.word[:remaining_trim] == tail_text[-remaining_trim:]:
-            # Remove whole words first
-            removed = 0
-            for seg in new_segments:
-                if not seg.words or removed >= words_removed:
-                    break
-                new_words = []
-                for w in seg.words:
-                    if removed < words_removed and w.start == w.end:
-                        removed += 1
-                        continue
-                    new_words.append(w)
-                seg.words = new_words
-
-            # Trim the partial word
-            next_word.word = next_word.word[remaining_trim:]
-
-            # Remove empty segments
-            new_segments = [s for s in new_segments if s.words]
-
-            logger.warning(
-                f"_remove_cross_call_text_overlap: removed {words_removed} words "
-                f"+ trimmed {remaining_trim} chars from partial word at cross-call boundary."
-            )
-
+    logger.warning(
+        f"_remove_cross_call_text_overlap: removed {words_removed} duplicate "
+        f"words ({chars_removed} chars) at cross-call boundary."
+    )
     return new_segments
 
 
@@ -442,18 +421,7 @@ def align_transcript_to_audio(
         aligned: stable_whisper.WhisperResult = model.align(
             audio, to_align_next, language=language, failure_threshold=zero_duration_segments_failure_ratio
         )
-        _strip_spurious_leading_space(aligned, to_align_next)
-        _fix_alignment_text_integrity(aligned, to_align_next)
-
-        # --- DEBUG TRACING (main pass post-fix) ---
-        _dbg_aligned_text = ''.join(w.word for s in aligned.segments for w in s.words)
-        if len(_dbg_aligned_text) != len(to_align_next):
-            logger.warning(
-                f"[TRACE main-pass] after _fix: aligned_text_len={len(_dbg_aligned_text)}, "
-                f"to_align_next_len={len(to_align_next)}, diff={len(_dbg_aligned_text) - len(to_align_next)}, "
-                f"aligned_tail={repr(_dbg_aligned_text[-40:])}"
-            )
-        # --- END DEBUG TRACING ---
+        _sanitize_align_result(aligned, to_align_next)
 
         any_good_alignemnts = aligned.segments[0].start != aligned.segments[-1].end
         # If unable to do any proper alignment - assume a confusion zone up front
@@ -511,19 +479,6 @@ def align_transcript_to_audio(
             # Keep properly aligned segments up to it including
             segments_already_aligned = aligned.segments[: probable_segment_before_confusion_zone.id + 1]
             aligned_pieces.extend(segments_already_aligned)
-
-            # --- DEBUG TRACING (commit segments_already_aligned) ---
-            _dbg_committed_text = ''.join(w.word for s in aligned_pieces for w in s.words)
-            _dbg_committed_tail = _dbg_committed_text[-60:]
-            _dbg_remaining_text = get_text_from_segments(aligned.segments[probable_segment_before_confusion_zone.id + 1 :])
-            logger.warning(
-                f"[TRACE commit] committed_total_len={len(_dbg_committed_text)}, "
-                f"remaining_len={len(_dbg_remaining_text)}, "
-                f"probable_seg_id={probable_segment_before_confusion_zone.id}, "
-                f"committed_tail={repr(_dbg_committed_tail)}, "
-                f"remaining_head={repr(_dbg_remaining_text[:60])}"
-            )
-            # --- END DEBUG TRACING ---
 
             # point to audio start for next try
             slice_start = probable_segment_before_confusion_zone.end
@@ -730,8 +685,7 @@ def align_transcript_to_audio(
             aligned_skipped: stable_whisper.WhisperResult = model.align(
                 audio, skipped_text_to_align, language=language, failure_threshold=zero_duration_segments_failure_ratio
             )
-            _strip_spurious_leading_space(aligned_skipped, skipped_text_to_align)
-            _fix_alignment_text_integrity(aligned_skipped, skipped_text_to_align)
+            _sanitize_align_result(aligned_skipped, skipped_text_to_align)
 
             # Ensure none of the segments has a start/end below the top aligned timestamp
             # or over the confusion zone audio slice end
@@ -747,18 +701,6 @@ def align_transcript_to_audio(
             # Remove text that may have been duplicated across the main alignment
             # pass (zero-duration tail) and this skip pass (zero-duration head).
             deduped_skipped = _remove_cross_call_text_overlap(aligned_pieces, aligned_skipped.segments)
-
-            # --- DEBUG TRACING (skip-pass commit) ---
-            _dbg_pieces_tail = ''.join(w.word for s in aligned_pieces[-3:] for w in s.words) if aligned_pieces else ''
-            _dbg_skip_head = ''.join(w.word for s in deduped_skipped[:3] for w in s.words) if deduped_skipped else ''
-            logger.warning(
-                f"[TRACE skip-commit] pieces_tail={repr(_dbg_pieces_tail[-40:])}, "
-                f"skip_head={repr(_dbg_skip_head[:40])}, "
-                f"skipped_text_len={len(skipped_text_to_align)}, "
-                f"deduped_segs={len(deduped_skipped)}"
-            )
-            # --- END DEBUG TRACING ---
-
             aligned_pieces.extend(deduped_skipped)  # consider this done (although it's unaligned == estimated)
 
             # Mark the top text we took from the unaligned - so we cannot match earlier than that
@@ -819,28 +761,6 @@ def align_transcript_to_audio(
         # Forget prev confusion zone
         min_confusion_zone_start = 0
         max_confusion_zone_end = 0
-
-    # --- DEBUG TRACING (final integrity check) ---
-    _dbg_final_text = ''.join(w.word for s in aligned_pieces for w in s.words)
-    _dbg_expected_text = unaligned.text
-    if len(_dbg_final_text) != len(_dbg_expected_text):
-        logger.warning(
-            f"[TRACE final] INTEGRITY MISMATCH: final_len={len(_dbg_final_text)}, "
-            f"expected_len={len(_dbg_expected_text)}, diff={len(_dbg_final_text) - len(_dbg_expected_text)}"
-        )
-        # Find where the difference is
-        import difflib as _dl
-        for _op, _a1, _a2, _b1, _b2 in _dl.SequenceMatcher(None, _dbg_expected_text, _dbg_final_text).get_opcodes():
-            if _op != 'equal':
-                logger.warning(
-                    f"[TRACE final]   {_op} at expected[{_a1}:{_a2}] final[{_b1}:{_b2}]: "
-                    f"expected={repr(_dbg_expected_text[_a1:_a2])}, "
-                    f"final={repr(_dbg_final_text[_b1:_b2])}, "
-                    f"context=...{repr(_dbg_expected_text[max(0,_a1-20):_a1])}|HERE|{repr(_dbg_expected_text[_a2:_a2+20])}..."
-                )
-    else:
-        logger.warning(f"[TRACE final] OK: final_len={len(_dbg_final_text)} matches expected")
-    # --- END DEBUG TRACING ---
 
     final_aligned = create_transcript_from_segments(aligned_pieces)
 
