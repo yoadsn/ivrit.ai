@@ -120,9 +120,14 @@ def _is_empty_audio(session_dir: pathlib.Path) -> bool:
 def _detect_and_flag_empty_audio_sessions(
     output_dir: pathlib.Path,
     session_ids: list[str],
+    force_vad: bool = False,
 ) -> set[str]:
     """Inspect VAD output for every session and write ``skipped.flag`` for
     sessions that contain no meaningful speech.
+
+    Sessions that are already flagged (have ``skipped.flag``) are skipped
+    unless *force_vad* is True, since their VAD output may have been
+    regenerated.
 
     Returns the set of session IDs that were flagged so the caller can remove
     them from any further processing lists.
@@ -134,6 +139,11 @@ def _detect_and_flag_empty_audio_sessions(
 
     flagged: set[str] = set()
     for sd in session_dirs:
+        # If already flagged as skipped, no need to re-check unless VAD was
+        # re-run (force_vad), which may have produced different results.
+        if not force_vad and (sd / SKIPPED_FLAG_FILENAME).exists():
+            flagged.add(sd.name)
+            continue
         if not _is_empty_audio(sd):
             continue
         flag_file = sd / SKIPPED_FLAG_FILENAME
@@ -463,7 +473,7 @@ def main() -> None:
 
         # --- Empty-audio detection (runs right after VAD) ---
         print("Checking for empty/silent audio sessions...")
-        flagged_ids = _detect_and_flag_empty_audio_sessions(output_dir, session_ids)
+        flagged_ids = _detect_and_flag_empty_audio_sessions(output_dir, session_ids, force_vad=args.force_vad)
         if flagged_ids:
             session_ids = [sid for sid in session_ids if sid not in flagged_ids]
 
