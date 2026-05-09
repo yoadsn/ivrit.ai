@@ -80,13 +80,19 @@ def align_transcript_to_audio(
     # text in-place now so that (a) the confusion-zone text-matching (find() calls
     # below) works correctly, and (b) character counts stay identical (\n and space
     # are both one character).
+    #
+    # Segment.text is a read-only property:
+    #   - when has_words=True  it returns ''.join(word.word for word in words)
+    #   - when has_words=False it returns _default_text
+    # So we must write through the appropriate backing store.
     for seg in unaligned.segments:
-        if '\n' in seg.text:
-            seg.text = seg.text.replace('\n', ' ')
         if seg.words:
             for word in seg.words:
                 if '\n' in word.word:
                     word.word = word.word.replace('\n', ' ')
+        else:
+            if '\n' in seg._default_text:
+                seg._default_text = seg._default_text.replace('\n', ' ')
 
     # If model is a string, load it using get_breakable_align_model
     if isinstance(model, str):
