@@ -42,6 +42,7 @@ dependencies = [
 [project.optional-dependencies]
 sources-preview = [
     "fastapi[standard]",
+    "wandb",
 ]
 
 [tool.uv]

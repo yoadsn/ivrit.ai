@@ -224,6 +224,11 @@ def main() -> None:
         help="Folder to store log files. If not specified, logging is disabled.",
     )
     parser.add_argument(
+        "--use-wandb-logging",
+        action="store_true",
+        help="Also stream logs to Weights & Biases (requires wandb to be installed and configured).",
+    )
+    parser.add_argument(
         "--download-workers",
         type=int,
         default=4,
@@ -302,6 +307,28 @@ def main() -> None:
         file_handler.setLevel(logging.INFO)
         file_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
         root_logger.addHandler(file_handler)
+
+        if args.use_wandb_logging:
+            try:
+                import wandb
+
+                wandb.init(project="knesset-committee-download", resume="allow")
+
+                class _WandbLogHandler(logging.Handler):
+                    """Forwards log records to wandb as plain-text log entries."""
+
+                    def emit(self, record: logging.LogRecord) -> None:
+                        try:
+                            wandb.log({"log": self.format(record)})
+                        except Exception:
+                            self.handleError(record)
+
+                wandb_handler = _WandbLogHandler(level=logging.INFO)
+                wandb_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+                root_logger.addHandler(wandb_handler)
+            except ImportError:
+                logging.warning("wandb is not installed; --use-wandb-logging has no effect.")
+
         logging.info("Starting Knesset committee download into %s", output_dir)
 
     # Parse the manifest.
