@@ -251,6 +251,63 @@ STEP_RATIO = 0.5
 BACKTRACK_FRAC = 0.3
 
 # ---------------------------------------------------------------------------
+# Prefix-sum TFV matrix
+# ---------------------------------------------------------------------------
+# The sliding-window TFV sweeps are accelerated by pre-computing a
+# prefix-sum matrix over the inaccurate text.  The entire text (length N)
+# is mapped to an (N+1, V) float64 matrix where V = _NUM_BINS.  The raw
+# bin-count vector for any window [a, b) is then simply P[b] - P[a] --
+# one numpy subtraction independent of window size.
+#
+# The character-to-bin mapping uses a dense ordinal lookup table
+# (_ORD_TO_BINS) that covers the Hebrew block and ASCII digits.
+
+_ORD_MAX = 0x05EB  # one past U+05EA (last Hebrew base letter)
+
+_ORD_TO_BINS = np.zeros((_ORD_MAX, _NUM_BINS), dtype=np.float64)
+
+for _ch, _indices in _CHAR_TO_BIN_INDICES.items():
+    _o = ord(_ch)
+    if _o < _ORD_MAX:
+        for _idx in _indices:
+            _ORD_TO_BINS[_o, _idx] = 1.0
+
+for _final, _base in _FINAL_TO_BASE.items():
+    _fo = ord(_final)
+    _bo = ord(_base)
+    if _fo < _ORD_MAX and _bo < _ORD_MAX:
+        _ORD_TO_BINS[_fo] = _ORD_TO_BINS[_bo]
+
+
+def _build_prefix_sums(text: str) -> np.ndarray:
+    """Build a prefix-sum matrix of shape ``(len(text)+1, _NUM_BINS)``.
+
+    ``prefix[i]`` holds the cumulative bin counts for ``text[0:i]``.
+    The raw counts for any window ``text[a:b]`` are ``prefix[b] - prefix[a]``.
+    """
+    n = len(text)
+    ords = np.array([ord(c) for c in text], dtype=np.int32)
+    ords[ords >= _ORD_MAX] = 0
+    char_bins = _ORD_TO_BINS[ords]  # shape (N, V)
+    prefix = np.zeros((n + 1, _NUM_BINS), dtype=np.float64)
+    np.cumsum(char_bins, axis=0, out=prefix[1:])
+    return prefix
+
+
+def _window_counts(prefix: np.ndarray, start: int, end: int) -> np.ndarray:
+    """Return the raw bin-count vector for text[start:end]."""
+    return prefix[end] - prefix[start]
+
+
+def _cosine_from_counts(target: np.ndarray, target_norm: float, counts: np.ndarray) -> float:
+    """Cosine similarity between a normalised target TFV and raw counts."""
+    counts_norm = float(np.linalg.norm(counts))
+    if counts_norm < 1e-12:
+        return 0.0
+    return float(np.dot(target, counts) / (target_norm * counts_norm))
+
+
+# ---------------------------------------------------------------------------
 # Preamble detection
 # ---------------------------------------------------------------------------
 
@@ -318,13 +375,20 @@ def detect_preamble_end(
         return 0
 
     probe_tfv = compute_tfv(accurate_text[:probe_len])
+    probe_norm = float(np.linalg.norm(probe_tfv))
+    if probe_norm < 1e-12:
+        return 0
+
+    prefix = _build_prefix_sums(inacc_text)
 
     # Coarse sweep across the entire inaccurate text.
     best_pos = 0
     best_sim = -1.0
+    max_pos = inacc_len - probe_len
     pos = 0
-    while pos + probe_len <= inacc_len:
-        sim = cosine_similarity(probe_tfv, compute_tfv(inacc_text[pos : pos + probe_len]))
+    while pos <= max_pos:
+        counts = _window_counts(prefix, pos, pos + probe_len)
+        sim = _cosine_from_counts(probe_tfv, probe_norm, counts)
         if sim > best_sim:
             best_sim = sim
             best_pos = pos
@@ -332,10 +396,11 @@ def detect_preamble_end(
 
     # Fine sweep around the coarse best.
     fine_start = max(0, best_pos - _PREAMBLE_FINE_RADIUS)
-    fine_end = min(inacc_len - probe_len, best_pos + _PREAMBLE_FINE_RADIUS)
+    fine_end = min(max_pos, best_pos + _PREAMBLE_FINE_RADIUS)
     pos = fine_start
     while pos <= fine_end:
-        sim = cosine_similarity(probe_tfv, compute_tfv(inacc_text[pos : pos + probe_len]))
+        counts = _window_counts(prefix, pos, pos + probe_len)
+        sim = _cosine_from_counts(probe_tfv, probe_norm, counts)
         if sim > best_sim:
             best_sim = sim
             best_pos = pos
@@ -366,13 +431,12 @@ class AnchorPoint:
 
 def _find_best_match(
     target_tfv: np.ndarray,
-    inaccurate: InaccurateText,
+    prefix: np.ndarray,
+    n: int,
     window_size: int,
     search_start: int,
     search_end: int,
 ) -> tuple[int, float]:
-    itext = inaccurate.full_text
-    n = len(itext)
     search_start = max(0, search_start)
     search_end = min(n - window_size, search_end)
     if search_start > search_end:
@@ -381,23 +445,31 @@ def _find_best_match(
     if search_end < 0:
         return 0, 0.0
 
+    target_norm = float(np.linalg.norm(target_tfv))
+    if target_norm < 1e-12:
+        return search_start, 0.0
+
     coarse_stride = max(1, window_size // COARSE_STRIDE_DIV)
     best_pos = search_start
     best_sim = -1.0
 
+    # Coarse sweep.
     pos = search_start
     while pos <= search_end:
-        sim = cosine_similarity(target_tfv, compute_tfv(itext[pos : pos + window_size]))
+        counts = _window_counts(prefix, pos, pos + window_size)
+        sim = _cosine_from_counts(target_tfv, target_norm, counts)
         if sim > best_sim:
             best_sim = sim
             best_pos = pos
         pos += coarse_stride
 
+    # Fine sweep around the coarse best.
     fine_start = max(search_start, best_pos - window_size)
     fine_end = min(search_end, best_pos + window_size)
     pos = fine_start
     while pos <= fine_end:
-        sim = cosine_similarity(target_tfv, compute_tfv(itext[pos : pos + window_size]))
+        counts = _window_counts(prefix, pos, pos + window_size)
+        sim = _cosine_from_counts(target_tfv, target_norm, counts)
         if sim > best_sim:
             best_sim = sim
             best_pos = pos
@@ -409,15 +481,14 @@ def _find_best_match(
 def _refine_match(
     accurate_text: str,
     acc_center: int,
-    inaccurate: InaccurateText,
+    prefix: np.ndarray,
+    n: int,
     coarse_inacc_pos: int,
     coarse_window: int,
     refine_window: int = REFINE_WINDOW_SIZE,
 ) -> tuple[int, float]:
-    itext = inaccurate.full_text
     acc_len = len(accurate_text)
-    inacc_len = len(itext)
-    rw = min(refine_window, acc_len, inacc_len)
+    rw = min(refine_window, acc_len, n)
 
     acc_start = max(0, acc_center - rw // 2)
     acc_start = min(acc_start, acc_len - rw)
@@ -428,18 +499,23 @@ def _refine_match(
         coarse_center = coarse_inacc_pos + coarse_window // 2
         return coarse_center, 0.0
     target_tfv = compute_tfv(snippet)
+    target_norm = float(np.linalg.norm(target_tfv))
 
     coarse_center = coarse_inacc_pos + coarse_window // 2
     search_start = max(0, coarse_center - coarse_window)
-    search_end = min(inacc_len - rw, coarse_center + coarse_window)
+    search_end = min(n - rw, coarse_center + coarse_window)
     if search_start > search_end:
+        return coarse_center, 0.0
+
+    if target_norm < 1e-12:
         return coarse_center, 0.0
 
     best_pos = search_start
     best_sim = -1.0
     pos = search_start
     while pos <= search_end:
-        sim = cosine_similarity(target_tfv, compute_tfv(itext[pos : pos + rw]))
+        counts = _window_counts(prefix, pos, pos + rw)
+        sim = _cosine_from_counts(target_tfv, target_norm, counts)
         if sim > best_sim:
             best_sim = sim
             best_pos = pos
@@ -456,6 +532,9 @@ def prealign_texts(
     inacc_start_offset: int = 0,
 ) -> list[AnchorPoint]:
     """Align accurate_text against inaccurate.
+
+    Uses a prefix-sum matrix over the inaccurate text for O(1) window
+    count lookups (see :func:`_build_prefix_sums`).
 
     Parameters
     ----------
@@ -478,6 +557,9 @@ def prealign_texts(
     backtrack = int(w * BACKTRACK_FRAC)
     ratio = effective_inacc_len / acc_len if acc_len > 0 else 1.0
 
+    # Build prefix sums once for the entire inaccurate text.
+    prefix = _build_prefix_sums(inaccurate.full_text)
+
     last_inacc_center = inacc_start_offset
     acc_pos = 0
     while acc_pos + w <= acc_len:
@@ -488,13 +570,17 @@ def prealign_texts(
         search_start = min(mono_start, prop_start)
         search_end = max(estimated_inacc_pos + 2 * w, last_inacc_center + 4 * w)
 
-        coarse_pos, sim = _find_best_match(target_tfv, inaccurate, w, search_start, search_end)
+        coarse_pos, sim = _find_best_match(
+            target_tfv, prefix, inacc_len, w, search_start, search_end,
+        )
         if sim < threshold:
             acc_pos += step
             continue
 
         acc_center = acc_pos + w // 2
-        refined_center, _ = _refine_match(accurate_text, acc_center, inaccurate, coarse_pos, w)
+        refined_center, _ = _refine_match(
+            accurate_text, acc_center, prefix, inacc_len, coarse_pos, w,
+        )
         center_clamped = max(0, min(refined_center, len(inaccurate.char_ts) - 1))
         ts_s = float(inaccurate.char_ts[center_clamped])
         anchors.append(AnchorPoint(char_index=acc_center, timestamp_s=ts_s, similarity=sim))
