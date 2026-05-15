@@ -18,6 +18,8 @@ tmp_*.py
 
 # Logs folder
 logs
+wandb/
 
 # Local Configuration files
 config/
+

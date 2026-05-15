@@ -41,8 +41,12 @@ dependencies = [
 
 [project.optional-dependencies]
 sources-preview = [
-    "fastapi[standard]",
-    "wandb",
+    "fastapi[standard]"
+]
+logging = [
+    "opentelemetry-sdk",
+    "opentelemetry-exporter-otlp-proto-http",
+    "opentelemetry-semantic-conventions",
 ]
 
 [tool.uv]

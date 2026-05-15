@@ -222,7 +222,7 @@ def vad_sessions(
         print("No audio files require VAD processing.")
         return
 
-    print(f"Running VAD on {len(audio_files)} audio file(s)...")
+    logger.info(f"Running VAD on {len(audio_files)} audio file(s)...")
 
     config = {
         "force_reprocess": force,
@@ -259,7 +259,7 @@ def vad_sessions(
     for idx, f in enumerate(audio_files):
         partitions[idx % num_devices].append(f)
 
-    print(
+    logger.info(
         f"Distributing VAD across {num_devices} device(s): "
         + ", ".join(
             f"{dev} ({len(p)} file(s))" for dev, p in zip(devices, partitions)

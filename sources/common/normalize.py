@@ -153,7 +153,7 @@ def normalize_entries(
             )
             normalizer_queue.put(normalizer)
             num_workers += 1
-    print(f"Initialized {num_workers} normalization workers")
+    logger.info(f"Initialized {num_workers} normalization workers")
 
     # Validate input folder exists before proceeding
     if not input_folder.exists() or not input_folder.is_dir():

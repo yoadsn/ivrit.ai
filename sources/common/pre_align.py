@@ -52,11 +52,12 @@ def add_prealign_args(parser: argparse.ArgumentParser) -> None:
     """Add common pre-align CLI flags to *parser*."""
     parser.add_argument(
         "--pre-align-devices",
-        type=str,
-        default=DEFAULT_PRE_ALIGN_DEVICES,
+        nargs="+",
+        default=[DEFAULT_PRE_ALIGN_DEVICES],
+        metavar="DEVICE",
         help=(
-            "Comma-separated list of torch devices for pre-align workers "
-            f"(e.g. 'cuda:0,cuda:1'). Default: {DEFAULT_PRE_ALIGN_DEVICES}."
+            "One or more torch devices for pre-align workers "
+            f"(e.g. cuda:0 cuda:1). Default: {DEFAULT_PRE_ALIGN_DEVICES}."
         ),
     )
     parser.add_argument(
@@ -935,7 +936,7 @@ def pre_align_sessions(
     output_dir: Path,
     accurate_text_resolver,
     session_ids: list[str],
-    devices: str = DEFAULT_PRE_ALIGN_DEVICES,
+    devices: list[str] | str = DEFAULT_PRE_ALIGN_DEVICES,
     model_name: str = DEFAULT_PRE_ALIGN_MODEL,
     compute_type: str = DEFAULT_COMPUTE_TYPE,
     language: str = "he",
@@ -944,8 +945,8 @@ def pre_align_sessions(
 ) -> dict[str, tuple[bool, Optional[str]]]:
     """Run the pre-align stage in parallel over a batch of session dirs.
 
-    One worker process is spawned per device parsed from the comma-separated
-    ``devices`` string.  Workers share a queue of session directory paths.
+    One worker process is spawned per device in ``devices``.  Workers share a
+    queue of session directory paths.
 
     Discovers session directories under *output_dir*, filters by
     *session_ids*, and skips sessions that lack required artifacts
@@ -961,7 +962,8 @@ def pre_align_sessions(
     session_ids:
         Restrict processing to these session IDs.
     devices:
-        Comma-separated device list (e.g. ``"cuda:0,cuda:1"``).
+        List of torch device strings (e.g. ``["cuda:0", "cuda:1"]``).
+        A plain string is also accepted for backwards compatibility.
     model_name:
         Whisper model name for faster-whisper.
     compute_type:
@@ -978,7 +980,10 @@ def pre_align_sessions(
     dict[str, tuple[bool, Optional[str]]]
         Mapping ``{str(session_dir): (ok, error_message_or_None)}``.
     """
-    device_list = [d.strip() for d in devices.split(",") if d.strip()]
+    if isinstance(devices, str):
+        device_list = [d.strip() for d in devices.split(",") if d.strip()]
+    else:
+        device_list = [d.strip() for d in devices if d.strip()]
     if not device_list:
         raise ValueError("pre_align_sessions requires at least one device.")
 
@@ -1047,15 +1052,20 @@ def pre_align_sessions(
 
     first_error: Optional[str] = None
     failed = 0
+    done = 0
     with tqdm(total=len(pending), unit="session", desc="Pre-aligning") as pbar:
         for _ in range(len(pending)):
             session_dir_str, ok, err = results_queue.get()
             results[session_dir_str] = (ok, err)
+            done += 1
             if not ok:
                 failed += 1
                 tqdm.write(f" - Pre-align failed for {Path(session_dir_str).name}: {err}")
+                logger.warn(f" - Pre-align failed for {Path(session_dir_str).name}: {err}")
                 if first_error is None and abort_on_error:
                     first_error = f"Pre-align failed for {session_dir_str}: {err}"
+            
+            logger.info(f"pre-aligned {done}/{len(pending)} sessions ({failed} failed)")
             pbar.set_postfix(failed=failed)
             pbar.update(1)
 

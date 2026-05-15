@@ -4,7 +4,6 @@ import logging
 import pathlib
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from logging.handlers import RotatingFileHandler
 
 from tqdm import tqdm
 
@@ -31,6 +30,7 @@ from sources.knesset.committee.refine_segments import (
 
 RAW_PROTOCOL_FILENAME = "raw.protocol.txt"
 from sources.common.definitions import SKIPPED_FLAG_FILENAME
+from sources.common.logging import add_logging_args, configure_logging
 from sources.knesset.committee.s3 import make_s3_client, s3_download, s3_uri_filename
 from sources.knesset.committee.vad import add_vad_args, vad_sessions
 from utils.audio import get_audio_info
@@ -218,16 +218,7 @@ def main() -> None:
         action="store_true",
         help="Skip audio download (useful when only the protocol text is needed).",
     )
-    parser.add_argument(
-        "--logs-folder",
-        type=str,
-        help="Folder to store log files. If not specified, logging is disabled.",
-    )
-    parser.add_argument(
-        "--use-wandb-logging",
-        action="store_true",
-        help="Also stream logs to Weights & Biases (requires wandb to be installed and configured).",
-    )
+    add_logging_args(parser)
     parser.add_argument(
         "--download-workers",
         type=int,
@@ -295,41 +286,8 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Configure logging.
-    logging.basicConfig(level=logging.CRITICAL + 1)
-    if args.logs_folder:
-        logs_folder = pathlib.Path(args.logs_folder)
-        logs_folder.mkdir(parents=True, exist_ok=True)
-        root_logger = logging.getLogger()
-        root_logger.setLevel(logging.INFO)
-        for handler in root_logger.handlers[:]:
-            root_logger.removeHandler(handler)
-        file_handler = RotatingFileHandler(logs_folder / "download_log", maxBytes=5 * 1024 * 1024, backupCount=5)
-        file_handler.setLevel(logging.INFO)
-        file_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
-        root_logger.addHandler(file_handler)
-
-        if args.use_wandb_logging:
-            try:
-                import wandb
-
-                wandb.init(project="knesset-committee-download", resume="allow")
-
-                class _WandbLogHandler(logging.Handler):
-                    """Forwards log records to wandb as plain-text log entries."""
-
-                    def emit(self, record: logging.LogRecord) -> None:
-                        try:
-                            wandb.log({"log": self.format(record)})
-                        except Exception:
-                            self.handleError(record)
-
-                wandb_handler = _WandbLogHandler(level=logging.INFO)
-                wandb_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
-                root_logger.addHandler(wandb_handler)
-            except ImportError:
-                logging.warning("wandb is not installed; --use-wandb-logging has no effect.")
-
-        logging.info("Starting Knesset committee download into %s", output_dir)
+    configure_logging(args)
+    logging.info("Starting Knesset committee download into %s", output_dir)
 
     # Parse the manifest.
     expected_columns = {"session_id", "start_date", "audio_file_path", "protocol_file_path"}
@@ -485,7 +443,7 @@ def main() -> None:
 
     # --- VAD stage (frame-level voice activity detection) ---
     if not args.skip_vad and not args.skip_audio:
-        print("Running VAD predictions...")
+        logging.info("Running VAD predictions...")
         vad_sessions(
             output_dir,
             force=args.force_vad,
@@ -499,14 +457,14 @@ def main() -> None:
         )
 
         # --- Empty-audio detection (runs right after VAD) ---
-        print("Checking for empty/silent audio sessions...")
+        logging.info("Checking for empty/silent audio sessions...")
         flagged_ids = _detect_and_flag_empty_audio_sessions(output_dir, session_ids, force_vad=args.force_vad)
         if flagged_ids:
             session_ids = [sid for sid in session_ids if sid not in flagged_ids]
 
     # --- Pre-align stage (batch, one worker per device) ---
     if not args.skip_pre_align and not args.skip_audio:
-        print("Pre-aligning sessions...")
+        logging.info("Pre-aligning sessions...")
         pre_align_sessions(
             output_dir,
             accurate_text_resolver=_committee_accurate_text_resolver,
@@ -521,7 +479,7 @@ def main() -> None:
 
     # --- Normalize stage (alignment + quality scoring) ---
     if not args.skip_normalize:
-        print("Starting normalization process...")
+        logging.info("Starting normalization process...")
         normalize_sessions(
             output_dir,
             align_model=args.align_model,
@@ -536,7 +494,7 @@ def main() -> None:
 
     # --- Refine segments stage (adjust segment boundaries using VAD) ---
     if not args.skip_refine_segments and not args.skip_audio:
-        print("Refining segment boundaries...")
+        logging.info("Refining segment boundaries...")
         refine_segments_sessions(
             output_dir,
             force=args.force_refine_segments
@@ -551,7 +509,7 @@ def main() -> None:
 
     # --- Create maps stage (char offsets + speaker IDs for aligned/refined segments) ---
     if not args.skip_create_maps:
-        print("Creating transcript maps...")
+        logging.info("Creating transcript maps...")
         create_maps_sessions(
             output_dir,
             force=args.force_create_maps
@@ -565,13 +523,14 @@ def main() -> None:
 
     # --- Build manifest stage ---
     if not args.skip_manifest:
-        print("Generating manifest CSV...")
+        logging.info("Generating manifest CSV...")
         build_manifest(str(output_dir))
 
     # --- Cleanup: remove per-session speech-probs numpy cache files ---
     for session_dir in output_dir.iterdir():
         if session_dir.is_dir():
             clear_speech_probs_cache(str(session_dir))
+
 
 
 if __name__ == "__main__":
