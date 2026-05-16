@@ -325,7 +325,7 @@ def create_maps_sessions(
         logger.info("No sessions with aligned transcripts found for map creation.")
         return
 
-    print(f"Creating maps for {len(session_dirs)} session(s) with {workers} worker(s)...")
+    logger.info(f"Creating maps for {len(session_dirs)} session(s) with {workers} worker(s)...")
 
     errors: list[Exception] = []
 
@@ -348,6 +348,7 @@ def create_maps_sessions(
                         else:
                             logger.info(msg)
                     if not ok:
+                        logger.warn(f" - WARNING: map creation skipped/failed for {session_dir.name}")
                         tqdm.write(f" - WARNING: map creation skipped/failed for {session_dir.name}")
                         if abort_on_error:
                             raise RuntimeError(f"Map creation failed for {session_dir.name}")
