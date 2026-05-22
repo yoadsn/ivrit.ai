@@ -37,6 +37,7 @@ dependencies = [
     "nemo_toolkit[asr]",
     "stable-ts==2.19.1",
     "scipy-stubs[scipy]==1.14.1.*",
+    "orjson>=3.11.9",
 ]
 
 [project.optional-dependencies]
