@@ -372,6 +372,17 @@ def parse_document_xml(source):
     def _start_para() -> None:
         nonlocal seen_any_para, in_para, full_pos, _para_idx, frontmatter_ended
         nonlocal p_xml_spk, p_xml_spk_id, p_xml_spk_name, p_clean_len, p_is_subject
+        # Force-close any speaker bookmarks that were opened in the current paragraph
+        # but whose bookmarkEnd never arrived (malformed/cross-paragraph bookmark).
+        # This mirrors the normal bookmarkEnd handling so the name is still extracted.
+        for bm_id in list(active_bm.keys()):
+            info = active_bm.pop(bm_id)
+            spk_id = info["speaker_id"]
+            raw = "".join(info["name_parts"]).strip()
+            cleaned = _clean_speaker_name(raw)
+            if cleaned:
+                p_xml_spk_name = cleaned
+                speaker_names[spk_id] = cleaned
         if in_para:
             _commit_para()
         if seen_any_para:
