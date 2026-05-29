@@ -17,7 +17,7 @@ from sources.common.normalize import (
 )
 from sources.common.normalize import add_common_normalize_args as add_normalize_args
 from sources.common.normalize import normalize_entries
-from sources.knesset.metadata import PlenumMetadata
+from sources.knesset.committee.metadata import CommitteeMetadata
 
 
 # Create a logger for this module
@@ -25,15 +25,15 @@ logger = logging.getLogger(__name__)
 
 
 class KnessetNormalizer(BaseNormalizer):
-    """Normalizer for Knesset plenum entries."""
+    """Normalizer for Knesset committee session entries."""
 
     def get_entry_id(self, entry_dir: pathlib.Path) -> str:
-        """Get the plenum ID from the directory name."""
+        """Get the committee session ID from the directory name."""
         return entry_dir.name
 
     def get_audio_file(self, entry_dir: pathlib.Path) -> pathlib.Path:
-        """Get the audio file path for the plenum."""
-        # Find the audio file in the plenum folder.
+        """Get the audio file path for the committee session."""
+        # Find the audio file in the committee session folder.
         # It starts with "audio" and the extension can be anything
         audio_file = next(entry_dir.glob("audio*"), None)
         if not audio_file:
@@ -46,22 +46,22 @@ class KnessetNormalizer(BaseNormalizer):
     def read_transcript_file_as_whisper_result(self, transcript_file):
         return stable_whisper.WhisperResult(str(transcript_file))
 
-    def get_language(self, metadata: PlenumMetadata) -> str:
+    def get_language(self, metadata: CommitteeMetadata) -> str:
         """Get the language for the plenum (always Hebrew for Knesset)."""
         return "he"  # Hebrew is the default language for Knesset
 
-    def get_duration(self, metadata: PlenumMetadata) -> float:
+    def get_duration(self, metadata: CommitteeMetadata) -> float:
         """Get the duration from metadata."""
         if metadata.duration is None:
             return 0.0
         return metadata.duration
 
-    def load_metadata(self, meta_file: pathlib.Path) -> PlenumMetadata:
+    def load_metadata(self, meta_file: pathlib.Path) -> CommitteeMetadata:
         """Load plenum metadata from file."""
         with open(meta_file, "r", encoding="utf-8") as f:
-            return PlenumMetadata(**json.load(f))
+            return CommitteeMetadata(**json.load(f))
 
-    def save_metadata(self, meta_file: pathlib.Path, metadata: PlenumMetadata) -> None:
+    def save_metadata(self, meta_file: pathlib.Path, metadata: CommitteeMetadata) -> None:
         """Save plenum metadata to file."""
         with open(meta_file, "w", encoding="utf-8") as f:
             f.write(metadata.model_dump_json(indent=2))
@@ -208,7 +208,7 @@ class KnessetNormalizer(BaseNormalizer):
         return True
 
 
-def normalize_plenums(
+def normalize_sessions(
     input_folder: pathlib.Path,
     align_model: str = DEFAULT_ALIGN_MODEL,
     align_devices: list[str] = [],
@@ -216,24 +216,24 @@ def normalize_plenums(
     force_normalize_reprocess: bool = False,
     force_rescore: bool = False,
     failure_threshold: float = DEFAULT_FAILURE_THRESHOLD,
-    plenum_ids: Optional[List[str]] = None,
+    session_ids: Optional[List[str]] = None,
     abort_on_error: bool = False,
 ) -> None:
     """
-    Normalize Knesset plenums.
+    Normalize Knesset committee sessions.
 
     Args:
-        input_folder: Path to the folder containing plenum directories
+        input_folder: Path to the folder containing session directories
         align_model: Model to use for alignment
         align_devices: List of devices to use for alignment (e.g., ["cuda:0", "cuda:1"]) - this also defines the number of workers
         force_normalize_reprocess: Whether to force reprocessing even if aligned transcript exists
         force_rescore: Whether to force recalculation of quality score
         failure_threshold: Threshold for alignment failure
-        plenum_ids: Optional list of plenum IDs to process (if None, process all)
+        session_ids: Optional list of session IDs to process (if None, process all)
         abort_on_err: If specified will crash on error instead of skipping that entry
     """
 
-    # Normalize plenums
+    # Normalize session
     normalize_entries(
         input_folder=input_folder,
         align_devices=align_devices,
@@ -243,9 +243,9 @@ def normalize_plenums(
         failure_threshold=failure_threshold,
         force_reprocess=force_normalize_reprocess,
         force_rescore=force_rescore,
-        entry_ids=plenum_ids,
+        entry_ids=session_ids,
         abort_on_error=abort_on_error,
     )
 
 
-__all__ = ["normalize_plenums", "add_normalize_args"]
+__all__ = ["normalize_sessions", "add_normalize_args"]

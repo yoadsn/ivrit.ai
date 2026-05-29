@@ -10,15 +10,15 @@ from nemo.collections.asr.parts.utils.vad_utils import init_frame_vad_model, pre
 from omegaconf import DictConfig
 
 from vad.vad_io import get_frame_vad_probs_filename
-from vad.definitions import SPEECH_PROB_FRAME_DURATION
+from vad.definitions import SPEECH_PROB_FRAME_DURATION, VAD_SPEECH_PROBS_FILENAME
 from vad.nemo_patched_logic import generate_vad_frame_pred
 from utils.audio import transcode_to_mono_16k
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def get_output_file_path(out_dir: str, source: str, episode: str):
-    return get_frame_vad_probs_filename(out_dir, source, episode)
+def get_output_file_path(out_dir: str, source: str, entry_id: str):
+    return get_frame_vad_probs_filename(out_dir, source, entry_id)
 
 
 def parallel_audio_file_adapt(from_to_tuples: list[tuple[str, str]], max_parallel_workers=1):
@@ -26,18 +26,55 @@ def parallel_audio_file_adapt(from_to_tuples: list[tuple[str, str]], max_paralle
         executor.map(lambda fromto: transcode_to_mono_16k(fromto[0], fromto[1]), from_to_tuples)
 
 
-def exclude_already_predicted(audio_files: list[str], final_output_fir: str):
+def _get_target_vad_path(audio_file: str, final_output_dir: str, sibling_mode: bool) -> str:
+    """Return the expected output ``speech_probs.frame`` path for *audio_file*.
+
+    When *sibling_mode* is ``True`` the file is placed directly next to the
+    audio file (``<audio_dir>/speech_probs.frame``).  Otherwise the legacy
+    layout is used: ``<final_output_dir>/<source>/<entry_id>/speech_probs.frame``.
+    """
+    if sibling_mode:
+        return str(Path(audio_file).parent / VAD_SPEECH_PROBS_FILENAME)
+    source = Path(audio_file).parent.name
+    entry_id = Path(audio_file).stem
+    return get_output_file_path(final_output_dir, source, entry_id)
+
+
+def exclude_already_predicted(
+    audio_files: list[str],
+    final_output_fir: str,
+    sibling_mode: bool = False,
+):
     pruned_audio_files = []
     for audio_file in audio_files:
-        source = Path(audio_file).parent.name
-        episode = Path(audio_file).stem
-        target_file_name = get_output_file_path(final_output_fir, source, episode)
+        target_file_name = _get_target_vad_path(audio_file, final_output_fir, sibling_mode)
         if not os.path.exists(target_file_name):
             pruned_audio_files.append(audio_file)
     return pruned_audio_files
 
 
-def generate_frame_vad_predictions(audio_files: list[str], final_output_fir: str, config: dict = {}) -> None:
+def generate_frame_vad_predictions(
+    audio_files: list[str],
+    final_output_fir: str,
+    config: dict = {},
+    sibling_mode: bool = False,
+) -> None:
+    """Generate frame-level VAD predictions for a list of audio files.
+
+    Parameters
+    ----------
+    audio_files:
+        Paths to the audio files to process.
+    final_output_fir:
+        Root directory for VAD output (ignored per-file when *sibling_mode* is
+        ``True``; still used for the temporary processing directory).
+    config:
+        Runtime tunables (see ``process.py`` for the full set of keys).
+    sibling_mode:
+        When ``True``, each ``speech_probs.frame`` file is written directly
+        alongside its source audio file instead of the legacy
+        ``<final_output_fir>/<source>/<entry_id>/`` layout.
+    """
     temp_processing_dir = os.path.join(final_output_fir, "vad_temp_processing")
     temp_input_source_dir = os.path.join(temp_processing_dir, "audio_files")
 
@@ -59,7 +96,7 @@ def generate_frame_vad_predictions(audio_files: list[str], final_output_fir: str
     # prune files which already have prediction from previous runs
     # unless configured to reprocess
     if not config["force_reprocess"]:
-        audio_files = exclude_already_predicted(audio_files, final_output_fir)
+        audio_files = exclude_already_predicted(audio_files, final_output_fir, sibling_mode)
 
     if len(audio_files) == 0:
         logging.warning("No new audio files to process. Exiting.")
@@ -71,8 +108,8 @@ def generate_frame_vad_predictions(audio_files: list[str], final_output_fir: str
     os.makedirs(temp_input_source_dir)
 
     # Create the input manifest from the audio files list
-    # Need to adapt the incoming file path structure (source/episode) to a unified
-    # filename source__episode - since NeMo tooling looks only at the filename and
+    # Need to adapt the incoming file path structure (source/entry) to a unified
+    # filename source__entry - since NeMo tooling looks only at the filename and
     # also requires it to be unique.
     # additionally the dataset loader would choke on non-mono input files.
     # so we will:
@@ -95,15 +132,15 @@ def generate_frame_vad_predictions(audio_files: list[str], final_output_fir: str
         flat_input_file = os.path.abspath(flat_input_file)
         audio_files_to_adapt_from_to_tuples.append((input_file, flat_input_file))
 
-    print(f"pre-trasncoding {len(audio_files_to_adapt_from_to_tuples)} audio files")
+    print(f"pre-transcoding {len(audio_files_to_adapt_from_to_tuples)} audio files")
     parallel_audio_file_adapt(
         audio_files_to_adapt_from_to_tuples, max_parallel_workers=config["nemo_vad_pretranscode_workers"]
     )
 
     input_manifest_audio_entries = [{"audio_filepath": af} for af in temp_input_file_list_relative]
     with open(cfg.input_manifest, "w", encoding="utf-8") as fout:
-        for entry in input_manifest_audio_entries:
-            json.dump(entry, fout)
+        for entry_id in input_manifest_audio_entries:
+            json.dump(entry_id, fout)
             fout.write("\n")
             fout.flush()
 
@@ -131,7 +168,14 @@ def generate_frame_vad_predictions(audio_files: list[str], final_output_fir: str
     manifest_vad_input = prepare_manifest(segment_prepare_config)
 
     torch.set_grad_enabled(False)
+
+    # Suppress noisy NeMo warnings about missing train/val/test data configs
+    # that are irrelevant during inference-only usage.
+    nemo_logger = logging.getLogger("nemo_logger")
+    prev_level = nemo_logger.level
+    nemo_logger.setLevel(logging.ERROR)
     vad_model = init_frame_vad_model(cfg.model_path)
+    nemo_logger.setLevel(prev_level)
 
     # setup_test_data
     vad_model.setup_test_data(
@@ -167,25 +211,18 @@ def generate_frame_vad_predictions(audio_files: list[str], final_output_fir: str
     logging.info(f"Copying results to output folder")
     for temp_frame_result_file_name in frame_level_temp_result_file_names:
         base_file_name = temp_frame_result_file_name.stem  # without .frame
-        # If there is not "stem" before the frame - NeMo stipped the "wav" suffix
+        # If there is not "stem" before the frame - NeMo stripped the "wav" suffix
         # (which is a very non general way of handling datasets, so we have to accommodate it)
         if base_file_name == Path(base_file_name).stem:
             base_file_name += ".wav"
 
-        # recover the original input audio filew name + path
+        # recover the original input audio file name + path
         input_audio_file = flat_input_file_map_to_input_file[base_file_name]
 
-        # get source + episode parts from the path - into final results output file
-        source = Path(input_audio_file).parent.name
-        episode = Path(input_audio_file).stem
-        target_file_name = get_output_file_path(final_output_fir, source, episode)
+        target_file_name = _get_target_vad_path(input_audio_file, final_output_fir, sibling_mode)
 
-        # ensure output dir exists
+        # ensure output dir exists and move the frame result file to final target
         Path(target_file_name).parent.mkdir(parents=True, exist_ok=True)
-
-        # move the frames result file to final target
-        # Ensure the target dir exists
-        Path(target_file_name).parent.mkdir(exist_ok=True, parents=True)
         os.replace(temp_frame_result_file_name, target_file_name)
 
     logging.info(f"Removing temporary processing directory")

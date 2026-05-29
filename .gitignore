@@ -12,12 +12,15 @@ venv
 # Data Folders
 data
 downloads
+local_run*.sh
 
 # Temporary Scrips
 tmp_*.py
 
 # Logs folder
 logs
+wandb/
 
 # Local Configuration files
 config/
+

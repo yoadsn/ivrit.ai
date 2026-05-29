@@ -3,16 +3,24 @@ import argparse
 import json
 import logging
 import pathlib
-import re
 from logging.handlers import RotatingFileHandler
 from typing import Any, Dict, List, Optional, Tuple
 
 from tqdm import tqdm
 
+from sources.common.pre_align import (
+    add_prealign_args,
+    pre_align_sessions,
+)
 from sources.generic.normalize import add_normalize_args, normalize_generic_entries
 from sources.generic.metadata import GenericMetadata, source_type
 from sources.generic.manifest import build_manifest
 from utils.audio import extract_audio_from_media, get_audio_info
+
+
+def _generic_accurate_text_resolver(entry_dir: pathlib.Path) -> pathlib.Path:
+    """Return the path to the accurate transcript text for a generic entry."""
+    return entry_dir / "transcript.txt"
 
 
 def process_transcripts(
@@ -274,6 +282,25 @@ def main() -> None:
         help="Folder to store log files. If not specified, logging is disabled.",
     )
 
+    # Pre-align (optional: transcribe audio + align with transcript text)
+    parser.add_argument(
+        "--use-prealign",
+        action="store_true",
+        help=(
+            "Enable the pre-align stage: transcribe the audio with a small "
+            "whisper model then align the inaccurate transcription with the "
+            "accurate transcript text to produce a timed transcript.json. "
+            "This transcript.json is then fed into normalize for breakable "
+            "alignment."
+        ),
+    )
+    parser.add_argument(
+        "--force-pre-align",
+        action="store_true",
+        help="Force re-run of the pre-align stage even if outputs exist.",
+    )
+    add_prealign_args(parser)
+
     # Add normalization-related arguments
     add_normalize_args(parser)
 
@@ -494,6 +521,22 @@ def main() -> None:
                 raise e
             tqdm.write(f" - Skipping to next entry")
 
+    # --- Pre-align stage (optional) ---
+    if args.use_prealign and not args.skip_pre_align:
+        entry_ids = [entry_id for _, _, _, entry_id in entries]
+        print("Pre-aligning entries...")
+        pre_align_sessions(
+            output_dir,
+            accurate_text_resolver=_generic_accurate_text_resolver,
+            session_ids=entry_ids,
+            devices=args.pre_align_devices,
+            model_name=args.pre_align_model_name,
+            compute_type=args.pre_align_compute_type,
+            language=args.language,
+            force=args.force_pre_align or args.force_reprocess,
+            abort_on_error=args.abort_on_error,
+        )
+
     # After downloads complete, process normalization if not skipped
     if not args.skip_normalize:
         print("Starting normalization process...")
@@ -506,7 +549,8 @@ def main() -> None:
             force_normalize_reprocess=args.force_reprocess
             or args.force_av_reprocess
             or args.force_transcript_reprocess
-            or args.force_normalize_reprocess,
+            or args.force_normalize_reprocess
+            or args.force_pre_align,
             # Any reason to write out scores to md or forced rescore?
             force_rescore=args.force_rescore or args.force_generate_metadata,
             failure_threshold=args.failure_threshold,

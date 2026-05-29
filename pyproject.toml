@@ -1,3 +1,61 @@
+[project]
+name = "ivrit-ai-data-pipeline"
+version = "0.1.0"
+requires-python = "==3.12.*"
+dependencies = [
+    "backoff",
+    "boto3==1.36.21",
+    "datasets",
+    "faster-whisper>=1.1.0",
+    "flask",
+    "Flask-OAuthlib",
+    "librosa",
+    "mutagen",
+    "hebrew",
+    "numpy<2",
+    "openai-whisper==20250625",
+    "pydub",
+    "sortedcontainers",
+    "soundfile",
+    "torch>=2.0,<2.11",
+    "torchaudio>=2.0,<2.11",
+    "transformers",
+    "feedparser",
+    "openai",
+    "python-dotenv",
+    "psycopg[binary]==3.2.4",
+    "jiwer",
+    "pandas",
+    "yt_dlp",
+    "beautifulsoup4",
+    "webvtt-py",
+    "scipy",
+    "tqdm",
+    "pydantic",
+    "pyodata",
+    "python-docx",
+    "nemo_toolkit[asr]",
+    "stable-ts==2.19.1",
+    "scipy-stubs[scipy]==1.14.1.*",
+    "orjson>=3.11.9",
+]
+
+[project.optional-dependencies]
+sources-preview = [
+    "fastapi[standard]"
+]
+logging = [
+    "opentelemetry-sdk",
+    "opentelemetry-exporter-otlp-proto-http",
+    "opentelemetry-semantic-conventions",
+]
+
+[tool.uv]
+# CUDA 12.4 wheels are the latest that work with driver 575 (CUDA 12.9 API).
+# PyTorch 2.11+ requires CUDA 13.0 (driver >= 576) which is not available here.
+index-url = "https://download.pytorch.org/whl/cu124"
+extra-index-url = ["https://pypi.org/simple"]
+
 [tool.black]
 line-length = 120
 
